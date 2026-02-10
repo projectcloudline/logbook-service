@@ -7,3 +7,4 @@ cdk.out/
 __pycache__/
 *.pyc
 .env
+.venv/

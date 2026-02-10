@@ -195,6 +195,21 @@ export class LogbookServiceStack extends cdk.Stack {
     const query = byTail.addResource('query');
     query.addMethod('POST', lambdaIntegration, { apiKeyRequired: true });
 
+    const entries = byTail.addResource('entries');
+    entries.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+
+    const entryById = entries.addResource('{entryId}');
+    entryById.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+
+    const inspections = byTail.addResource('inspections');
+    inspections.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+
+    const ads = byTail.addResource('ads');
+    ads.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+
+    const parts = byTail.addResource('parts');
+    parts.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+
     // ─── API Key & Usage Plan ──────────────────────────────────
     const apiKey = api.addApiKey('LogbookApiKey', {
       apiKeyName: 'logbook-service-key',

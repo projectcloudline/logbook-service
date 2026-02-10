@@ -24,10 +24,13 @@ def get_gemini_client() -> genai.Client:
     global _gemini_client
     if _gemini_client:
         return _gemini_client
-    secret = json.loads(
-        sm.get_secret_value(SecretId=os.environ['GEMINI_SECRET_ARN'])['SecretString']
-    )
-    _gemini_client = genai.Client(api_key=secret['api_key'])
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        secret = json.loads(
+            sm.get_secret_value(SecretId=os.environ['GEMINI_SECRET_ARN'])['SecretString']
+        )
+        api_key = secret['api_key']
+    _gemini_client = genai.Client(api_key=api_key)
     return _gemini_client
 
 
@@ -130,8 +133,60 @@ def process_page(logbook_id: str, page_id: str, page_number: int, s3_key: str):
     print(f'Page {page_id}: extracted {len(entries)} entries')
 
 
+def normalize_entry_type(entry: dict):
+    """Normalize legacy entry types from Gemini output.
+
+    Maps old subtypes (annual, 100hr, etc.) to the new schema where
+    entry_type is one of: maintenance, inspection, ad_compliance, other.
+    Populates inspectionType for inspection subtypes.
+    """
+    entry_type = entry.get('entryType', 'maintenance')
+    inspection_type = entry.get('inspectionType')
+
+    # Legacy subtypes that should be entry_type='inspection'
+    legacy_inspection_map = {
+        'annual': 'annual',
+        '100hr': '100hr',
+        'progressive': 'progressive',
+        'altimeter_check': 'altimeter_static',
+        'transponder_check': 'transponder',
+    }
+
+    if entry_type in legacy_inspection_map:
+        entry['inspectionType'] = legacy_inspection_map[entry_type]
+        entry['entryType'] = 'inspection'
+    elif entry_type == 'inspection' and not inspection_type:
+        entry['inspectionType'] = 'other'
+
+    # Ensure entry_type is valid
+    if entry.get('entryType') not in ('maintenance', 'inspection', 'ad_compliance', 'other'):
+        entry['entryType'] = 'other'
+
+
+VALID_ACTION_TYPES = {'installed', 'removed', 'replaced', 'repaired', 'inspected', 'overhauled'}
+
+# Map Gemini's creative action types to valid ones
+ACTION_TYPE_MAP = {
+    'reinstalled': 'installed',
+    'serviced': 'repaired',
+    'applied': 'installed',
+    'adjusted': 'repaired',
+    'cleaned': 'repaired',
+    'tested': 'inspected',
+    'calibrated': 'inspected',
+    'lubricated': 'repaired',
+}
+
+
 def save_entry(conn, aircraft_id: str, page_id: str, entry: dict):
     """Save a single extracted maintenance entry and its sub-records."""
+    normalize_entry_type(entry)
+
+    # Skip entries with no date — Gemini couldn't read it, nothing useful to store
+    if not entry.get('date'):
+        print(f'  Skipping entry with no date (narrative: {entry.get("maintenanceNarrative", "")[:80]}...)')
+        return
+
     # Insert maintenance_entries
     entry_id = None
     with conn.cursor() as cur:
@@ -171,6 +226,9 @@ def save_entry(conn, aircraft_id: str, page_id: str, entry: dict):
 
     # Parts actions
     for part in entry.get('partsActions', []):
+        action = part.get('action', 'installed')
+        if action not in VALID_ACTION_TYPES:
+            action = ACTION_TYPE_MAP.get(action, 'installed')
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO parts_actions
@@ -178,7 +236,7 @@ def save_entry(conn, aircraft_id: str, page_id: str, entry: dict):
                     old_part_number, old_serial_number, quantity, notes)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
-                    entry_id, part.get('action', 'installed'),
+                    entry_id, action,
                     part.get('partName'), part.get('partNumber'),
                     part.get('serialNumber'), part.get('oldPartNumber'),
                     part.get('oldSerialNumber'), part.get('quantity', 1),
@@ -202,7 +260,10 @@ def save_entry(conn, aircraft_id: str, page_id: str, entry: dict):
             conn.commit()
 
     # Inspection record
+    VALID_INSPECTION_TYPES = {'annual', '100hr', '50hr', 'progressive', 'altimeter_static', 'transponder', 'elt', 'other'}
     if entry.get('inspectionType'):
+        if entry['inspectionType'] not in VALID_INSPECTION_TYPES:
+            entry['inspectionType'] = 'other'
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO inspection_records
@@ -242,7 +303,7 @@ def generate_embedding(entry_id: str, text: str):
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO maintenance_embeddings (entry_id, embedding, chunk_text, chunk_type)
-               VALUES (%s, %s::vector, %s, 'narrative')
+               VALUES (%s, %s::halfvec, %s, 'narrative')
                ON CONFLICT (entry_id, chunk_type) DO UPDATE SET embedding = EXCLUDED.embedding, chunk_text = EXCLUDED.chunk_text""",
             (entry_id, embedding_str, text)
         )

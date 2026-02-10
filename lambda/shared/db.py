@@ -11,14 +11,24 @@ _cached_conn = None
 
 
 def get_db_credentials() -> dict:
-    """Fetch DB credentials from Secrets Manager (cached for Lambda warm starts)."""
+    """Fetch DB credentials. Uses DB_HOST env var for local dev, Secrets Manager for Lambda."""
     global _cached_secret
     if _cached_secret:
         return _cached_secret
 
-    client = boto3.client('secretsmanager', region_name='us-west-2')
-    resp = client.get_secret_value(SecretId=os.environ['DB_SECRET_ARN'])
-    _cached_secret = json.loads(resp['SecretString'])
+    if os.environ.get('DB_HOST'):
+        _cached_secret = {
+            'host': os.environ['DB_HOST'],
+            'port': int(os.environ.get('DB_PORT', '5432')),
+            'dbname': os.environ.get('DB_NAME', 'postgres'),
+            'username': os.environ.get('DB_USER', 'postgres'),
+            'password': os.environ.get('DB_PASSWORD', 'postgres'),
+        }
+    else:
+        client = boto3.client('secretsmanager', region_name='us-west-2')
+        resp = client.get_secret_value(SecretId=os.environ['DB_SECRET_ARN'])
+        _cached_secret = json.loads(resp['SecretString'])
+
     return _cached_secret
 
 

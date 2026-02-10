@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS aircraft (
 CREATE TABLE IF NOT EXISTS logbook_documents (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     aircraft_id UUID REFERENCES aircraft(id),
-    logbook_type VARCHAR(20) NOT NULL CHECK (logbook_type IN ('airframe', 'engine', 'propeller')),
+    logbook_type VARCHAR(20) NOT NULL CHECK (logbook_type IN ('airframe', 'engine', 'propeller', 'avionics', 'appliance')),
     source_filename VARCHAR(500) NOT NULL,
     s3_key VARCHAR(500),
     file_hash VARCHAR(64),
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS maintenance_entries (
     aircraft_id UUID NOT NULL REFERENCES aircraft(id),
     page_id UUID REFERENCES logbook_pages(id),
     entry_type VARCHAR(30) DEFAULT 'maintenance'
-        CHECK (entry_type IN ('maintenance', 'inspection', 'altimeter_check', 'transponder_check', 'annual', '100hr', 'progressive', 'other')),
+        CHECK (entry_type IN ('maintenance', 'inspection', 'ad_compliance', 'other')),
     entry_date DATE NOT NULL,
     hobbs_time DECIMAL(10,1),
     tach_time DECIMAL(10,1),
@@ -75,11 +75,11 @@ CREATE TABLE IF NOT EXISTS maintenance_entries (
     time_since_overhaul DECIMAL(10,1),
     shop_name VARCHAR(200),
     shop_address TEXT,
-    shop_phone VARCHAR(50),
-    repair_station_number VARCHAR(50),
+    shop_phone VARCHAR(100),
+    repair_station_number VARCHAR(100),
     mechanic_name VARCHAR(200),
-    mechanic_certificate VARCHAR(50),
-    work_order_number VARCHAR(50),
+    mechanic_certificate VARCHAR(100),
+    work_order_number VARCHAR(100),
     maintenance_narrative TEXT NOT NULL,
     confidence_score DECIMAL(3,2),
     needs_review BOOLEAN DEFAULT FALSE,
@@ -172,14 +172,14 @@ CREATE TABLE IF NOT EXISTS inspection_records (
     aircraft_id UUID NOT NULL REFERENCES aircraft(id),
     entry_id UUID REFERENCES maintenance_entries(id),
     inspection_type VARCHAR(30) NOT NULL
-        CHECK (inspection_type IN ('annual', '100hr', 'progressive', 'altimeter_static', 'transponder', 'elt', 'other')),
+        CHECK (inspection_type IN ('annual', '100hr', '50hr', 'progressive', 'altimeter_static', 'transponder', 'elt', 'other')),
     inspection_date DATE NOT NULL,
     aircraft_hours DECIMAL(10,1),
     next_due_date DATE,
     next_due_hours DECIMAL(10,1),
-    far_reference VARCHAR(50),
+    far_reference VARCHAR(100),
     inspector_name VARCHAR(200),
-    inspector_certificate VARCHAR(50),
+    inspector_certificate VARCHAR(100),
     notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -187,13 +187,13 @@ CREATE TABLE IF NOT EXISTS inspection_records (
 CREATE INDEX IF NOT EXISTS idx_inspection_aircraft ON inspection_records(aircraft_id);
 
 -- =====================================================
--- EMBEDDINGS (3072 dims for gemini-embedding-001)
+-- EMBEDDINGS (3072 half-precision dims for gemini-embedding-001)
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS maintenance_embeddings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     entry_id UUID NOT NULL REFERENCES maintenance_entries(id) ON DELETE CASCADE,
-    embedding vector(3072),
+    embedding halfvec(3072),
     chunk_text TEXT NOT NULL,
     chunk_type VARCHAR(30) DEFAULT 'narrative'
         CHECK (chunk_type IN ('narrative', 'parts', 'ad_compliance', 'full_entry')),
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS maintenance_embeddings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_embeddings_vector ON maintenance_embeddings
-    USING hnsw (embedding vector_cosine_ops);
+    USING hnsw (embedding halfvec_cosine_ops);
 
 -- =====================================================
 -- TRIGGERS

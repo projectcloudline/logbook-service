@@ -23,6 +23,12 @@ For each maintenance entry found, extract:
 - Parts actions (installed, removed, replaced, repaired) with P/N, S/N, quantity
 - Any inspection signoffs (annual, 100hr, etc.)
 
+ENTRY TYPE CLASSIFICATION RULES:
+- "inspection" = any inspection event (annual, 100-hour, progressive, altimeter/static, transponder, ELT check). Always set inspectionType to the specific subtype.
+- "ad_compliance" = work performed specifically to comply with an Airworthiness Directive
+- "maintenance" = routine maintenance, repairs, oil changes, component replacements, STC installations
+- "other" = anything that does not fit the above categories
+
 IMPORTANT GUIDELINES:
 - Transcribe handwritten text as accurately as possible
 - If a value is unclear, include your best guess with [?] marker
@@ -54,7 +60,7 @@ Return JSON format:
       "mechanicCertificate": "A&P or IA number",
       "workOrderNumber": "work order #",
       "maintenanceNarrative": "complete transcription of work performed",
-      "entryType": "maintenance" | "inspection" | "annual" | "100hr" | "altimeter_check" | "transponder_check" | "other",
+      "entryType": "maintenance" | "inspection" | "ad_compliance" | "other",
       "adCompliance": [
         {"adNumber": "AD number", "method": "inspection|replacement|modification|terminating_action", "notes": ""}
       ],
@@ -69,7 +75,7 @@ Return JSON format:
           "quantity": 1
         }
       ],
-      "inspectionType": "annual" | "100hr" | "progressive" | null,
+      "inspectionType": "annual" | "100hr" | "50hr" | "progressive" | "altimeter_static" | "transponder" | "elt" | null,
       "farReference": "FAR reference if mentioned",
       "confidence": 0.0,
       "missingData": [],
