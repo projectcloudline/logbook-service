@@ -5,6 +5,7 @@ import os
 import uuid
 import tempfile
 from pathlib import Path
+from urllib.parse import unquote_plus
 
 import boto3
 import fitz  # pymupdf
@@ -23,7 +24,7 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif'}
 def handler(event, context):
     """Handle S3 PUT event for uploaded logbook files."""
     for record in event.get('Records', []):
-        s3_key = record['s3']['object']['key']
+        s3_key = unquote_plus(record['s3']['object']['key'])
         bucket = record['s3']['bucket']['name']
 
         print(f'Processing upload: s3://{bucket}/{s3_key}')

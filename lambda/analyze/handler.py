@@ -83,7 +83,7 @@ def process_page(logbook_id: str, page_id: str, page_number: int, s3_key: str):
         ),
     )
 
-    response_text = response.text if hasattr(response, 'text') else ''
+    response_text = (response.text or '') if hasattr(response, 'text') else ''
     # Clean markdown fences
     if response_text.startswith('```json'):
         response_text = response_text[7:]
@@ -93,7 +93,11 @@ def process_page(logbook_id: str, page_id: str, page_number: int, s3_key: str):
         response_text = response_text[:-3]
     response_text = response_text.strip()
 
-    extraction = json.loads(response_text)
+    if not response_text:
+        print(f'WARNING: empty Gemini response for page {page_id}, skipping')
+        extraction = {'pageType': 'other', 'entries': []}
+    else:
+        extraction = json.loads(response_text)
 
     # Store raw extraction
     with conn.cursor() as cur:
@@ -246,7 +250,11 @@ def save_entry(conn, aircraft_id: str, page_id: str, entry: dict):
             conn.commit()
 
     # AD compliance
+    VALID_COMPLIANCE_METHODS = {'inspection', 'replacement', 'modification', 'terminating_action', 'recurring', 'not_applicable', 'other'}
     for ad in entry.get('adCompliance', []):
+        method = ad.get('method')
+        if method and method not in VALID_COMPLIANCE_METHODS:
+            method = 'other'
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO ad_compliance
@@ -254,7 +262,7 @@ def save_entry(conn, aircraft_id: str, page_id: str, entry: dict):
                    VALUES (%s,%s,%s,%s,%s,%s)""",
                 (
                     entry_id, aircraft_id, ad.get('adNumber'),
-                    entry.get('date'), ad.get('method'), ad.get('notes'),
+                    entry.get('date'), method, ad.get('notes'),
                 )
             )
             conn.commit()
