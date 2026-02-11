@@ -4,6 +4,7 @@ import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
@@ -16,6 +17,23 @@ import * as path from 'path';
 export class LogbookServiceStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    // ─── VPC (existing Forge VPC with fck-nat) ─────────────────
+    const vpc = ec2.Vpc.fromLookup(this, 'ForgeVpc', {
+      vpcId: 'vpc-0b9528238d153559f',
+    });
+
+    const lambdaSg = new ec2.SecurityGroup(this, 'LambdaSecurityGroup', {
+      vpc,
+      description: 'Logbook Lambda functions',
+      allowAllOutbound: true,
+    });
+
+    const lambdaVpcConfig = {
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [lambdaSg],
+    };
 
     // ─── Secrets ───────────────────────────────────────────────
     const dbSecret = secretsmanager.Secret.fromSecretCompleteArn(this, 'DbSecret',
@@ -58,14 +76,11 @@ export class LogbookServiceStack extends cdk.Stack {
       ANALYZE_QUEUE_URL: analyzeQueue.queueUrl,
     };
 
-    // ─── Lambda Layer (shared code) ────────────────────────────
-    // Shared Python code is bundled via PYTHONPATH in each Lambda.
-    // For pymupdf and google-genai, use Docker-bundled Lambdas.
-
     // ─── API Lambda ────────────────────────────────────────────
     const apiFunction = new lambda.Function(this, 'ApiFunction', {
       functionName: 'logbook-api',
       runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'handler.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'api'), {
         bundling: {
@@ -85,12 +100,14 @@ export class LogbookServiceStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: sharedEnv,
+      ...lambdaVpcConfig,
     });
 
     // ─── Split Lambda ──────────────────────────────────────────
     const splitFunction = new lambda.Function(this, 'SplitFunction', {
       functionName: 'logbook-split',
       runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'handler.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'split'), {
         bundling: {
@@ -111,12 +128,14 @@ export class LogbookServiceStack extends cdk.Stack {
       memorySize: 1024,
       ephemeralStorageSize: cdk.Size.mebibytes(1024),
       environment: sharedEnv,
+      ...lambdaVpcConfig,
     });
 
     // ─── Analyze Lambda ────────────────────────────────────────
     const analyzeFunction = new lambda.Function(this, 'AnalyzeFunction', {
       functionName: 'logbook-analyze',
       runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'handler.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'analyze'), {
         bundling: {
@@ -137,6 +156,7 @@ export class LogbookServiceStack extends cdk.Stack {
       memorySize: 512,
       environment: sharedEnv,
       reservedConcurrentExecutions: 5, // rate-limit Gemini calls
+      ...lambdaVpcConfig,
     });
 
     // ─── Permissions ───────────────────────────────────────────

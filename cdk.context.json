@@ -1,0 +1,65 @@
+{
+  "vpc-provider:account=266798531919:filter.vpc-id=vpc-0b9528238d153559f:region=us-west-2:returnAsymmetricSubnets=true": {
+    "vpcId": "vpc-0b9528238d153559f",
+    "vpcCidrBlock": "10.0.0.0/16",
+    "ownerAccountId": "266798531919",
+    "availabilityZones": [],
+    "subnetGroups": [
+      {
+        "name": "Private",
+        "type": "Private",
+        "subnets": [
+          {
+            "subnetId": "subnet-05c3358335a277819",
+            "cidr": "10.0.2.0/24",
+            "availabilityZone": "us-west-2a",
+            "routeTableId": "rtb-01bfc84750a0f14e7"
+          },
+          {
+            "subnetId": "subnet-0b730c89e7b4b216e",
+            "cidr": "10.0.3.0/24",
+            "availabilityZone": "us-west-2b",
+            "routeTableId": "rtb-08498dea4e49f0c46"
+          }
+        ]
+      },
+      {
+        "name": "Public",
+        "type": "Public",
+        "subnets": [
+          {
+            "subnetId": "subnet-0f708d498b16c133c",
+            "cidr": "10.0.0.0/24",
+            "availabilityZone": "us-west-2a",
+            "routeTableId": "rtb-0389aa17822b565f4"
+          },
+          {
+            "subnetId": "subnet-07ca435ef975495ba",
+            "cidr": "10.0.1.0/24",
+            "availabilityZone": "us-west-2b",
+            "routeTableId": "rtb-04910bfdd88780b8b"
+          }
+        ]
+      },
+      {
+        "name": "Database",
+        "type": "Isolated",
+        "subnets": [
+          {
+            "subnetId": "subnet-03c568cbbb9f86dbb",
+            "cidr": "10.0.4.0/24",
+            "availabilityZone": "us-west-2a",
+            "routeTableId": "rtb-05820baefdb2496f4"
+          },
+          {
+            "subnetId": "subnet-049fbe58ac48ff705",
+            "cidr": "10.0.5.0/24",
+            "availabilityZone": "us-west-2b",
+            "routeTableId": "rtb-0081a1fc8e8bd47b6"
+          }
+        ]
+      }
+    ]
+  },
+  "ami:account=266798531919:filters.image-type.0=machine:filters.name.0=fck-nat-al2023-*-arm64-ebs:filters.state.0=available:owners.0=568608671756:region=us-west-2": "ami-01098b43e0994f4bb"
+}
