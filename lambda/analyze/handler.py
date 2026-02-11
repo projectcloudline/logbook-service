@@ -29,7 +29,7 @@ def get_gemini_client() -> genai.Client:
         secret = json.loads(
             sm.get_secret_value(SecretId=os.environ['GEMINI_SECRET_ARN'])['SecretString']
         )
-        api_key = secret['api_key']
+        api_key = secret['GEMINI_API_KEY']
     _gemini_client = genai.Client(api_key=api_key)
     return _gemini_client
 

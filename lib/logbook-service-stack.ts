@@ -18,8 +18,8 @@ export class LogbookServiceStack extends cdk.Stack {
     const dbSecret = secretsmanager.Secret.fromSecretCompleteArn(this, 'DbSecret',
       'arn:aws:secretsmanager:us-west-2:266798531919:secret:dev/forge/db-credentials-QtTX2H'
     );
-    const geminiSecret = secretsmanager.Secret.fromSecretNameV2(this, 'GeminiSecret',
-      'dev/forge/gemini-api-key'
+    const appSecrets = secretsmanager.Secret.fromSecretNameV2(this, 'AppSecrets',
+      'dev/forge/app/secrets'
     );
 
     // ─── S3 Bucket ─────────────────────────────────────────────
@@ -51,7 +51,7 @@ export class LogbookServiceStack extends cdk.Stack {
     const sharedEnv: Record<string, string> = {
       BUCKET_NAME: bucket.bucketName,
       DB_SECRET_ARN: dbSecret.secretArn,
-      GEMINI_SECRET_ARN: geminiSecret.secretArn,
+      GEMINI_SECRET_ARN: appSecrets.secretArn,
       ANALYZE_QUEUE_URL: analyzeQueue.queueUrl,
     };
 
@@ -144,8 +144,8 @@ export class LogbookServiceStack extends cdk.Stack {
     dbSecret.grantRead(apiFunction);
     dbSecret.grantRead(splitFunction);
     dbSecret.grantRead(analyzeFunction);
-    geminiSecret.grantRead(analyzeFunction);
-    geminiSecret.grantRead(apiFunction); // for RAG endpoint
+    appSecrets.grantRead(analyzeFunction);
+    appSecrets.grantRead(apiFunction); // for RAG endpoint
 
     analyzeQueue.grantSendMessages(splitFunction);
     analyzeQueue.grantConsumeMessages(analyzeFunction);

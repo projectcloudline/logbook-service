@@ -267,7 +267,7 @@ def handle_query(tail_number, event):
         sm = boto3.client('secretsmanager', region_name='us-west-2')
         gemini_key = json.loads(
             sm.get_secret_value(SecretId=os.environ['GEMINI_SECRET_ARN'])['SecretString']
-        ).get('api_key', '')
+        ).get('GEMINI_API_KEY', '')
 
     from google import genai
     from google.genai import types
