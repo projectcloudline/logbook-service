@@ -1,0 +1,837 @@
+openapi: 3.0.3
+info:
+  title: Logbook Service API
+  description: |
+    Aircraft maintenance logbook digitization and query API.
+
+    Upload scanned logbook PDFs, automatically extract maintenance entries via AI,
+    and query structured maintenance history per aircraft tail number.
+
+    ## Authentication
+    All endpoints require an API key passed via the `x-api-key` header.
+
+    ## Workflow
+    1. **Upload** a logbook PDF via `POST /logbooks/upload` — returns a presigned S3 URL
+    2. **PUT** the PDF to the presigned URL
+    3. **Poll** `GET /logbooks/{id}/status` until processing completes
+    4. **Query** extracted data via the `/aircraft/{tailNumber}/*` endpoints
+  version: 1.0.0
+  contact:
+    name: CloudLine
+    url: https://cloudline.aero
+
+servers:
+  - url: https://logbooks.cloudline.aero
+    description: Production
+
+security:
+  - apiKey: []
+
+tags:
+  - name: Logbooks
+    description: Upload and track logbook processing
+  - name: Aircraft
+    description: Query maintenance data by tail number
+  - name: RAG
+    description: Natural language queries over maintenance records
+
+paths:
+  /logbooks/upload:
+    post:
+      operationId: uploadLogbook
+      tags: [Logbooks]
+      summary: Upload a logbook PDF
+      description: |
+        Creates a logbook document record and returns a presigned S3 URL for uploading
+        the PDF. After uploading, the service automatically splits the PDF into pages
+        and queues each page for AI extraction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tailNumber]
+              properties:
+                tailNumber:
+                  type: string
+                  description: Aircraft registration / N-number
+                  example: N69ZA
+                logbookType:
+                  type: string
+                  enum: [airframe, engine, propeller, avionics, appliance]
+                  default: airframe
+                filename:
+                  type: string
+                  description: Original filename
+                  default: logbook.pdf
+      responses:
+        '200':
+          description: Logbook created — upload the PDF to the presigned URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logbookId:
+                    type: string
+                    format: uuid
+                  uploadUrl:
+                    type: string
+                    format: uri
+                    description: Presigned S3 PUT URL (expires in 1 hour)
+                  s3Key:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /logbooks/{id}/status:
+    get:
+      operationId: getLogbookStatus
+      tags: [Logbooks]
+      summary: Get logbook processing status
+      description: Returns the processing status of a logbook, including page-level progress.
+      parameters:
+        - $ref: '#/components/parameters/logbookId'
+      responses:
+        '200':
+          description: Logbook status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logbookId:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [pending, processing, completed, failed]
+                  filename:
+                    type: string
+                  logbookType:
+                    type: string
+                  pageCount:
+                    type: integer
+                  completedPages:
+                    type: integer
+                  createdAt:
+                    type: string
+                    format: date-time
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/logbooks:
+    get:
+      operationId: listLogbooks
+      tags: [Aircraft]
+      summary: List logbooks for an aircraft
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+      responses:
+        '200':
+          description: List of logbooks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  logbooks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LogbookSummary'
+
+  /aircraft/{tailNumber}/summary:
+    get:
+      operationId: getAircraftSummary
+      tags: [Aircraft]
+      summary: Maintenance summary for an aircraft
+      description: |
+        Aggregate view of an aircraft's maintenance status: last annual, last 100hr,
+        last oil change, total time, and upcoming expirations within 90 days.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+      responses:
+        '200':
+          description: Aircraft maintenance summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  aircraft:
+                    $ref: '#/components/schemas/Aircraft'
+                  lastAnnual:
+                    $ref: '#/components/schemas/InspectionSnapshot'
+                  last100hr:
+                    $ref: '#/components/schemas/InspectionSnapshot'
+                  lastOilChange:
+                    $ref: '#/components/schemas/InspectionSnapshot'
+                  totalTime:
+                    type: number
+                    nullable: true
+                    description: Most recent flight time reading
+                  upcomingExpirations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                        name:
+                          type: string
+                        expiration_date:
+                          type: string
+                          format: date
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/entries:
+    get:
+      operationId: listEntries
+      tags: [Aircraft]
+      summary: List maintenance entries
+      description: Paginated, filterable list of all maintenance entries for an aircraft.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [maintenance, inspection, ad_compliance, other]
+          description: Filter by entry type
+        - name: dateFrom
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Entries on or after this date
+        - name: dateTo
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Entries on or before this date
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: Paginated entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EntryListItem'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/entries/{entryId}:
+    get:
+      operationId: getEntryDetail
+      tags: [Aircraft]
+      summary: Get entry detail
+      description: |
+        Full detail for a single maintenance entry including parts actions,
+        AD compliance records, and inspection record if applicable.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+        - name: entryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Entry detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  entry:
+                    $ref: '#/components/schemas/EntryDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/inspections:
+    get:
+      operationId: listInspections
+      tags: [Aircraft]
+      summary: Inspection history
+      description: |
+        Paginated inspection history with a `latestByType` summary showing the most
+        recent inspection of each type.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [annual, 100hr, 50hr, progressive, altimeter_static, transponder, elt, other]
+          description: Filter by inspection type
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: Inspection history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  inspections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InspectionRecord'
+                  latestByType:
+                    type: array
+                    description: Most recent inspection per type
+                    items:
+                      type: object
+                      properties:
+                        inspection_type:
+                          type: string
+                        inspection_date:
+                          type: string
+                          format: date
+                        next_due_date:
+                          type: string
+                          format: date
+                          nullable: true
+                        next_due_hours:
+                          type: number
+                          nullable: true
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/ads:
+    get:
+      operationId: listADs
+      tags: [Aircraft]
+      summary: AD compliance records
+      description: Paginated Airworthiness Directive compliance history.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: AD compliance records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  ads:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ADComplianceRecord'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/parts:
+    get:
+      operationId: listParts
+      tags: [Aircraft]
+      summary: Life-limited parts inventory
+      description: List life-limited parts for an aircraft, ordered by soonest expiration.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, all]
+            default: active
+          description: Filter by active status
+      responses:
+        '200':
+          description: Parts inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  parts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LifeLimitedPart'
+                  total:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/query:
+    post:
+      operationId: queryMaintenance
+      tags: [RAG]
+      summary: Natural language query
+      description: |
+        Ask a question about an aircraft's maintenance history in plain English.
+        Uses vector similarity search over maintenance narratives and answers
+        with Gemini, citing specific entries.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question:
+                  type: string
+                  description: Natural language question
+                  example: When was the last time the alternator was replaced?
+      responses:
+        '200':
+          description: RAG answer with sources
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  question:
+                    type: string
+                  answer:
+                    type: string
+                    description: AI-generated answer based on maintenance records
+                  sources:
+                    type: array
+                    description: Top matching maintenance entries used as context
+                    items:
+                      type: object
+                      properties:
+                        date:
+                          type: string
+                          format: date
+                        type:
+                          type: string
+                        inspectionType:
+                          type: string
+                          nullable: true
+                        similarity:
+                          type: number
+                          description: Cosine similarity score (0-1)
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+
+  parameters:
+    tailNumber:
+      name: tailNumber
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Aircraft registration / N-number
+      example: N69ZA
+    logbookId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Logbook document ID
+    page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      description: Page number
+    limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+      description: Results per page (max 100)
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+
+  schemas:
+    Aircraft:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        registration:
+          type: string
+        serial_number:
+          type: string
+          nullable: true
+        make:
+          type: string
+          nullable: true
+        model:
+          type: string
+          nullable: true
+        engine_model:
+          type: string
+          nullable: true
+        engine_serial:
+          type: string
+          nullable: true
+        propeller_model:
+          type: string
+          nullable: true
+        propeller_serial:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    LogbookSummary:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        logbook_type:
+          type: string
+          enum: [airframe, engine, propeller, avionics, appliance]
+        source_filename:
+          type: string
+        processing_status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        page_count:
+          type: integer
+          nullable: true
+        date_range_start:
+          type: string
+          format: date
+          nullable: true
+        date_range_end:
+          type: string
+          format: date
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    InspectionSnapshot:
+      type: object
+      nullable: true
+      description: Date and flight time of a specific inspection or event
+      properties:
+        entry_date:
+          type: string
+          format: date
+        flight_time:
+          type: number
+          nullable: true
+
+    EntryListItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        entry_type:
+          type: string
+          enum: [maintenance, inspection, ad_compliance, other]
+        entry_date:
+          type: string
+          format: date
+        hobbs_time:
+          type: number
+          nullable: true
+        tach_time:
+          type: number
+          nullable: true
+        flight_time:
+          type: number
+          nullable: true
+        shop_name:
+          type: string
+          nullable: true
+        mechanic_name:
+          type: string
+          nullable: true
+        maintenance_narrative:
+          type: string
+        confidence_score:
+          type: number
+          nullable: true
+          description: AI extraction confidence (0-1)
+        needs_review:
+          type: boolean
+        inspection_type:
+          type: string
+          nullable: true
+          enum: [annual, 100hr, 50hr, progressive, altimeter_static, transponder, elt, other, null]
+
+    EntryDetail:
+      allOf:
+        - $ref: '#/components/schemas/EntryListItem'
+        - type: object
+          properties:
+            time_since_overhaul:
+              type: number
+              nullable: true
+            shop_address:
+              type: string
+              nullable: true
+            shop_phone:
+              type: string
+              nullable: true
+            repair_station_number:
+              type: string
+              nullable: true
+            mechanic_certificate:
+              type: string
+              nullable: true
+            work_order_number:
+              type: string
+              nullable: true
+            missing_data:
+              type: array
+              nullable: true
+              items:
+                type: string
+            review_status:
+              type: string
+              enum: [pending, approved, corrected, rejected]
+            partsActions:
+              type: array
+              items:
+                $ref: '#/components/schemas/PartAction'
+            adCompliance:
+              type: array
+              items:
+                $ref: '#/components/schemas/ADCompliance'
+            inspectionRecord:
+              $ref: '#/components/schemas/InspectionRecord'
+
+    PartAction:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        action_type:
+          type: string
+          enum: [installed, removed, replaced, repaired, inspected, overhauled]
+        part_name:
+          type: string
+          nullable: true
+        part_number:
+          type: string
+          nullable: true
+        serial_number:
+          type: string
+          nullable: true
+        old_part_number:
+          type: string
+          nullable: true
+        old_serial_number:
+          type: string
+          nullable: true
+        quantity:
+          type: integer
+        notes:
+          type: string
+          nullable: true
+
+    ADCompliance:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        ad_number:
+          type: string
+        compliance_date:
+          type: string
+          format: date
+          nullable: true
+        compliance_method:
+          type: string
+          nullable: true
+          enum: [inspection, replacement, modification, terminating_action, recurring, not_applicable, other]
+        notes:
+          type: string
+          nullable: true
+
+    ADComplianceRecord:
+      allOf:
+        - $ref: '#/components/schemas/ADCompliance'
+        - type: object
+          properties:
+            next_due_date:
+              type: string
+              format: date
+              nullable: true
+            next_due_hours:
+              type: number
+              nullable: true
+            entry_date:
+              type: string
+              format: date
+              nullable: true
+            maintenance_narrative:
+              type: string
+              nullable: true
+            shop_name:
+              type: string
+              nullable: true
+
+    InspectionRecord:
+      type: object
+      nullable: true
+      properties:
+        id:
+          type: string
+          format: uuid
+        inspection_type:
+          type: string
+          enum: [annual, 100hr, 50hr, progressive, altimeter_static, transponder, elt, other]
+        inspection_date:
+          type: string
+          format: date
+        aircraft_hours:
+          type: number
+          nullable: true
+        next_due_date:
+          type: string
+          format: date
+          nullable: true
+        next_due_hours:
+          type: number
+          nullable: true
+        far_reference:
+          type: string
+          nullable: true
+        inspector_name:
+          type: string
+          nullable: true
+        inspector_certificate:
+          type: string
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        maintenance_narrative:
+          type: string
+          nullable: true
+        shop_name:
+          type: string
+          nullable: true
+
+    LifeLimitedPart:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        part_name:
+          type: string
+        part_number:
+          type: string
+          nullable: true
+        serial_number:
+          type: string
+          nullable: true
+        install_date:
+          type: string
+          format: date
+          nullable: true
+        install_hours:
+          type: number
+          nullable: true
+        life_limit_hours:
+          type: number
+          nullable: true
+        life_limit_months:
+          type: integer
+          nullable: true
+        expiration_date:
+          type: string
+          format: date
+          nullable: true
+        is_active:
+          type: boolean
+        removal_date:
+          type: string
+          format: date
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+        limit:
+          type: integer
+        total:
+          type: integer
+        totalPages:
+          type: integer

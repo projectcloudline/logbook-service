@@ -7,6 +7,9 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -163,12 +166,30 @@ export class LogbookServiceStack extends cdk.Stack {
       })
     );
 
+    // ─── Custom Domain ────────────────────────────────────────
+    const domainName = 'logbooks.cloudline.aero';
+    const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'LogbooksZone', {
+      hostedZoneId: 'Z01347853MP9W5UL29YNK',
+      zoneName: domainName,
+    });
+
+    const certificate = new acm.Certificate(this, 'LogbooksCert', {
+      domainName,
+      validation: acm.CertificateValidation.fromDns(hostedZone),
+    });
+
     // ─── API Gateway ───────────────────────────────────────────
     const api = new apigateway.RestApi(this, 'LogbookApi', {
       restApiName: 'Logbook Service',
       description: 'Aircraft logbook digitization API',
       apiKeySourceType: apigateway.ApiKeySourceType.HEADER,
       deployOptions: { stageName: 'v1' },
+      endpointTypes: [apigateway.EndpointType.REGIONAL],
+      domainName: {
+        domainName,
+        certificate,
+        endpointType: apigateway.EndpointType.REGIONAL,
+      },
     });
 
     const lambdaIntegration = new apigateway.LambdaIntegration(apiFunction);
@@ -222,7 +243,14 @@ export class LogbookServiceStack extends cdk.Stack {
     usagePlan.addApiKey(apiKey);
     usagePlan.addApiStage({ stage: api.deploymentStage });
 
+    // ─── DNS Record ────────────────────────────────────────────
+    new route53.ARecord(this, 'LogbooksARecord', {
+      zone: hostedZone,
+      target: route53.RecordTarget.fromAlias(new route53Targets.ApiGateway(api)),
+    });
+
     // ─── Outputs ───────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'CustomDomainUrl', { value: `https://${domainName}/` });
     new cdk.CfnOutput(this, 'ApiUrl', { value: api.url });
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'QueueUrl', { value: analyzeQueue.queueUrl });
