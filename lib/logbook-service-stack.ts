@@ -8,6 +8,8 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as eventsTargets from 'aws-cdk-lib/aws-events-targets';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
@@ -276,6 +278,14 @@ export class LogbookServiceStack extends cdk.Stack {
     });
     usagePlan.addApiKey(apiKey);
     usagePlan.addApiStage({ stage: api.deploymentStage });
+
+    // ─── Lambda Warmer ─────────────────────────────────────────
+    new events.Rule(this, 'ApiWarmerRule', {
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [new eventsTargets.LambdaFunction(apiFunction, {
+        event: events.RuleTargetInput.fromObject({ source: 'logbook.warmer' }),
+      })],
+    });
 
     // ─── DNS Record ────────────────────────────────────────────
     new route53.ARecord(this, 'LogbooksARecord', {

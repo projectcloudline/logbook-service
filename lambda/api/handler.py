@@ -42,6 +42,10 @@ def paginated_response(items, total, page, limit):
 
 def handler(event, context):
     """Main API Gateway proxy handler."""
+    # Warming ping from EventBridge — return immediately to keep container warm
+    if event.get('source') == 'logbook.warmer':
+        return {'statusCode': 200, 'body': 'warm'}
+
     method = event['httpMethod']
     path = event['resource']
     path_params = event.get('pathParameters') or {}
