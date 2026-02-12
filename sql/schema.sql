@@ -25,10 +25,12 @@ CREATE TABLE IF NOT EXISTS aircraft (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS logbook_documents (
+CREATE TABLE IF NOT EXISTS upload_batches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     aircraft_id UUID REFERENCES aircraft(id),
-    logbook_type VARCHAR(20) NOT NULL CHECK (logbook_type IN ('airframe', 'engine', 'propeller', 'avionics', 'appliance')),
+    logbook_type VARCHAR(20) CHECK (logbook_type IN ('airframe', 'engine', 'propeller', 'avionics', 'appliance')),
+    upload_type VARCHAR(20) DEFAULT 'pdf'
+        CHECK (upload_type IN ('pdf', 'multi_image')),
     source_filename VARCHAR(500) NOT NULL,
     s3_key VARCHAR(500),
     file_hash VARCHAR(64),
@@ -36,14 +38,14 @@ CREATE TABLE IF NOT EXISTS logbook_documents (
     date_range_start DATE,
     date_range_end DATE,
     processing_status VARCHAR(20) DEFAULT 'pending'
-        CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+        CHECK (processing_status IN ('pending', 'processing', 'completed', 'completed_with_errors', 'failed')),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS logbook_pages (
+CREATE TABLE IF NOT EXISTS upload_pages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    document_id UUID NOT NULL REFERENCES logbook_documents(id) ON DELETE CASCADE,
+    document_id UUID NOT NULL REFERENCES upload_batches(id) ON DELETE CASCADE,
     page_number INTEGER NOT NULL,
     image_path VARCHAR(500) NOT NULL,  -- S3 key
     page_type VARCHAR(50),
@@ -65,7 +67,7 @@ CREATE TABLE IF NOT EXISTS logbook_pages (
 CREATE TABLE IF NOT EXISTS maintenance_entries (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     aircraft_id UUID NOT NULL REFERENCES aircraft(id),
-    page_id UUID REFERENCES logbook_pages(id),
+    page_id UUID REFERENCES upload_pages(id),
     entry_type VARCHAR(30) DEFAULT 'maintenance'
         CHECK (entry_type IN ('maintenance', 'inspection', 'ad_compliance', 'other')),
     entry_date DATE NOT NULL,

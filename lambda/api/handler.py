@@ -11,7 +11,9 @@ from shared.db import execute_query, execute_insert, get_connection
 from shared.models import api_response
 
 s3 = boto3.client('s3')
+sqs = boto3.client('sqs')
 BUCKET = os.environ['BUCKET_NAME']
+ANALYZE_QUEUE_URL = os.environ.get('ANALYZE_QUEUE_URL', '')
 
 DEFAULT_PAGE_LIMIT = 25
 MAX_PAGE_LIMIT = 100
@@ -43,17 +45,25 @@ def handler(event, context):
     path_params = event.get('pathParameters') or {}
 
     try:
-        # POST /logbooks/upload
-        if path == '/logbooks/upload' and method == 'POST':
+        # POST /uploads
+        if path == '/uploads' and method == 'POST':
             return handle_upload(event)
 
-        # GET /logbooks/{id}/status
-        elif path == '/logbooks/{id}/status' and method == 'GET':
+        # GET /uploads/{id}/status
+        elif path == '/uploads/{id}/status' and method == 'GET':
             return handle_status(path_params['id'])
 
-        # GET /aircraft/{tailNumber}/logbooks
-        elif path == '/aircraft/{tailNumber}/logbooks' and method == 'GET':
-            return handle_list_logbooks(path_params['tailNumber'])
+        # POST /uploads/{id}/process
+        elif path == '/uploads/{id}/process' and method == 'POST':
+            return handle_process(path_params['id'])
+
+        # GET /uploads/{id}/pages/{pageNumber}/image
+        elif path == '/uploads/{id}/pages/{pageNumber}/image' and method == 'GET':
+            return handle_page_image(path_params['id'], int(path_params['pageNumber']))
+
+        # GET /aircraft/{tailNumber}/uploads
+        elif path == '/aircraft/{tailNumber}/uploads' and method == 'GET':
+            return handle_list_uploads(path_params['tailNumber'])
 
         # GET /aircraft/{tailNumber}/summary
         elif path == '/aircraft/{tailNumber}/summary' and method == 'GET':
@@ -91,11 +101,16 @@ def handler(event, context):
 
 
 def handle_upload(event):
-    """Create a logbook document record and return a presigned upload URL."""
+    """Create an upload batch and return presigned upload URL(s).
+
+    PDF mode (default): single presigned URL for a PDF, triggers split Lambda on upload.
+    Multi-image mode (pageCount present): presigned URLs per page image, requires POST /uploads/{id}/process.
+    """
     body = json.loads(event.get('body') or '{}')
     tail_number = body.get('tailNumber', '').upper().strip()
-    logbook_type = body.get('logbookType', 'airframe')
+    log_type = body.get('logType')
     filename = body.get('filename', 'logbook.pdf')
+    page_count = body.get('pageCount')
 
     if not tail_number:
         return api_response(400, {'error': 'tailNumber is required'})
@@ -108,69 +123,116 @@ def handle_upload(event):
         (tail_number,)
     )
 
-    # Create logbook_documents record
-    logbook_id = str(uuid.uuid4())
-    execute_insert(
-        """INSERT INTO logbook_documents (id, aircraft_id, logbook_type, source_filename, s3_key, processing_status)
-           VALUES (%s, %s, %s, %s, %s, 'pending') RETURNING id""",
-        (logbook_id, aircraft_id, logbook_type, filename, f'uploads/{logbook_id}/{filename}')
-    )
+    batch_id = str(uuid.uuid4())
 
-    # Generate presigned PUT URL
-    s3_key = f'uploads/{logbook_id}/{filename}'
-    upload_url = s3.generate_presigned_url(
-        'put_object',
-        Params={'Bucket': BUCKET, 'Key': s3_key, 'ContentType': 'application/pdf'},
-        ExpiresIn=3600,
-    )
+    if page_count:
+        # Multi-image upload mode
+        page_count = int(page_count)
+        if page_count < 1 or page_count > 500:
+            return api_response(400, {'error': 'pageCount must be between 1 and 500'})
 
-    return api_response(200, {
-        'logbookId': logbook_id,
-        'uploadUrl': upload_url,
-        's3Key': s3_key,
-    })
+        execute_insert(
+            """INSERT INTO upload_batches (id, aircraft_id, logbook_type, upload_type, source_filename, page_count, processing_status)
+               VALUES (%s, %s, %s, 'multi_image', %s, %s, 'pending') RETURNING id""",
+            (batch_id, aircraft_id, log_type, filename, page_count)
+        )
+
+        uploads = []
+        for i in range(1, page_count + 1):
+            page_key = f'pages/{batch_id}/page_{i:04d}.jpg'
+            url = s3.generate_presigned_url(
+                'put_object',
+                Params={'Bucket': BUCKET, 'Key': page_key, 'ContentType': 'image/jpeg'},
+                ExpiresIn=3600,
+            )
+            uploads.append({'pageNumber': i, 'uploadUrl': url, 's3Key': page_key})
+
+        return api_response(200, {
+            'uploadId': batch_id,
+            'uploadType': 'multi_image',
+            'pageCount': page_count,
+            'uploads': uploads,
+        })
+    else:
+        # PDF upload mode (existing flow)
+        s3_key = f'uploads/{batch_id}/{filename}'
+        execute_insert(
+            """INSERT INTO upload_batches (id, aircraft_id, logbook_type, upload_type, source_filename, s3_key, processing_status)
+               VALUES (%s, %s, %s, 'pdf', %s, %s, 'pending') RETURNING id""",
+            (batch_id, aircraft_id, log_type, filename, s3_key)
+        )
+
+        upload_url = s3.generate_presigned_url(
+            'put_object',
+            Params={'Bucket': BUCKET, 'Key': s3_key, 'ContentType': 'application/pdf'},
+            ExpiresIn=3600,
+        )
+
+        return api_response(200, {
+            'uploadId': batch_id,
+            'uploadType': 'pdf',
+            'uploadUrl': upload_url,
+            's3Key': s3_key,
+        })
 
 
-def handle_status(logbook_id):
-    """Return processing status for a logbook."""
+def handle_status(batch_id):
+    """Return processing status for an upload batch."""
     rows = execute_query(
-        """SELECT ld.id, ld.processing_status, ld.page_count, ld.source_filename,
-                  ld.logbook_type, ld.created_at,
-                  COUNT(lp.id) FILTER (WHERE lp.extraction_status = 'completed') AS completed_pages,
-                  COUNT(lp.id) AS total_pages
-           FROM logbook_documents ld
-           LEFT JOIN logbook_pages lp ON lp.document_id = ld.id
-           WHERE ld.id = %s
-           GROUP BY ld.id""",
-        (logbook_id,)
+        """SELECT ub.id, ub.processing_status, ub.page_count, ub.source_filename,
+                  ub.logbook_type, ub.upload_type, ub.created_at,
+                  COUNT(up.id) FILTER (WHERE up.extraction_status = 'completed') AS completed_pages,
+                  COUNT(up.id) FILTER (WHERE up.extraction_status = 'failed') AS failed_pages,
+                  COUNT(up.id) FILTER (WHERE up.needs_review = TRUE) AS needs_review_pages,
+                  COUNT(up.id) AS total_pages
+           FROM upload_batches ub
+           LEFT JOIN upload_pages up ON up.document_id = ub.id
+           WHERE ub.id = %s
+           GROUP BY ub.id""",
+        (batch_id,)
     )
     if not rows:
-        return api_response(404, {'error': 'Logbook not found'})
+        return api_response(404, {'error': 'Upload not found'})
 
     row = rows[0]
-    return api_response(200, {
-        'logbookId': str(row['id']),
+    result = {
+        'uploadId': str(row['id']),
         'status': row['processing_status'],
         'filename': row['source_filename'],
-        'logbookType': row['logbook_type'],
+        'logType': row['logbook_type'],
+        'uploadType': row['upload_type'],
         'pageCount': row['page_count'] or row['total_pages'],
         'completedPages': row['completed_pages'],
+        'failedPages': row['failed_pages'],
+        'needsReviewPages': row['needs_review_pages'],
         'createdAt': row['created_at'],
-    })
+    }
+
+    if row['failed_pages'] > 0:
+        failed_rows = execute_query(
+            """SELECT page_number FROM upload_pages
+               WHERE document_id = %s AND extraction_status = 'failed'
+               ORDER BY page_number""",
+            (batch_id,)
+        )
+        result['failedPageNumbers'] = [r['page_number'] for r in failed_rows]
+
+    return api_response(200, result)
 
 
-def handle_list_logbooks(tail_number):
-    """List all logbooks for an aircraft."""
+def handle_list_uploads(tail_number):
+    """List all uploads for an aircraft."""
     rows = execute_query(
-        """SELECT ld.id, ld.logbook_type, ld.source_filename, ld.processing_status,
-                  ld.page_count, ld.date_range_start, ld.date_range_end, ld.created_at
-           FROM logbook_documents ld
-           JOIN aircraft a ON ld.aircraft_id = a.id
+        """SELECT ub.id, ub.logbook_type, ub.upload_type, ub.source_filename,
+                  ub.processing_status, ub.page_count, ub.date_range_start,
+                  ub.date_range_end, ub.created_at
+           FROM upload_batches ub
+           JOIN aircraft a ON ub.aircraft_id = a.id
            WHERE a.registration = %s
-           ORDER BY ld.created_at DESC""",
+           ORDER BY ub.created_at DESC""",
         (tail_number.upper(),)
     )
-    return api_response(200, {'tailNumber': tail_number.upper(), 'logbooks': rows})
+    return api_response(200, {'tailNumber': tail_number.upper(), 'uploads': rows})
 
 
 def handle_summary(tail_number):
@@ -241,6 +303,98 @@ def handle_summary(tail_number):
         'lastOilChange': oil[0] if oil else None,
         'totalTime': tt[0]['flight_time'] if tt else None,
         'upcomingExpirations': expirations,
+    })
+
+
+def handle_process(batch_id):
+    """Finalize a multi-image upload: verify images, create page records, queue for analysis."""
+    conn = get_connection()
+
+    # Atomic status transition: pending → processing (only for multi_image uploads)
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE upload_batches SET processing_status = 'processing', updated_at = NOW()
+               WHERE id = %s AND upload_type = 'multi_image' AND processing_status = 'pending'
+               RETURNING id, page_count""",
+            (batch_id,)
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        return api_response(409, {
+            'error': 'Upload not found, not a multi-image upload, or already processing'
+        })
+
+    page_count = row[1]
+
+    # Verify all page images exist in S3
+    prefix = f'pages/{batch_id}/'
+    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+    found_keys = {obj['Key'] for obj in resp.get('Contents', [])}
+    expected_keys = {f'pages/{batch_id}/page_{i:04d}.jpg' for i in range(1, page_count + 1)}
+    missing = expected_keys - found_keys
+
+    if missing:
+        # Roll back to pending
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE upload_batches SET processing_status = 'pending', updated_at = NOW() WHERE id = %s",
+                (batch_id,)
+            )
+            conn.commit()
+        missing_pages = sorted(int(k.split('_')[-1].split('.')[0]) for k in missing)
+        return api_response(400, {
+            'error': f'Missing {len(missing)} page image(s)',
+            'missingPages': missing_pages,
+        })
+
+    # Create upload_pages records and queue SQS messages
+    for i in range(1, page_count + 1):
+        page_key = f'pages/{batch_id}/page_{i:04d}.jpg'
+        page_id = execute_insert(
+            """INSERT INTO upload_pages (document_id, page_number, image_path, extraction_status)
+               VALUES (%s, %s, %s, 'pending') RETURNING id""",
+            (batch_id, i, page_key)
+        )
+
+        sqs.send_message(
+            QueueUrl=ANALYZE_QUEUE_URL,
+            MessageBody=json.dumps({
+                'uploadId': batch_id,
+                'pageId': page_id,
+                'pageNumber': i,
+                's3Key': page_key,
+            }),
+        )
+
+    return api_response(200, {
+        'uploadId': batch_id,
+        'status': 'processing',
+        'pagesQueued': page_count,
+    })
+
+
+def handle_page_image(batch_id, page_number):
+    """Return a presigned GET URL for a page image."""
+    rows = execute_query(
+        """SELECT image_path FROM upload_pages
+           WHERE document_id = %s AND page_number = %s""",
+        (batch_id, page_number)
+    )
+    if not rows:
+        return api_response(404, {'error': 'Page not found'})
+
+    image_url = s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': BUCKET, 'Key': rows[0]['image_path']},
+        ExpiresIn=3600,
+    )
+
+    return api_response(200, {
+        'uploadId': batch_id,
+        'pageNumber': page_number,
+        'imageUrl': image_url,
     })
 
 

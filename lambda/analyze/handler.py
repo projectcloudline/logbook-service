@@ -38,29 +38,29 @@ def handler(event, context):
     """Process SQS messages — one page per message."""
     for record in event.get('Records', []):
         msg = json.loads(record['body'])
-        logbook_id = msg['logbookId']
+        batch_id = msg['uploadId']
         page_id = msg['pageId']
         page_number = msg['pageNumber']
         s3_key = msg['s3Key']
 
-        print(f'Analyzing page {page_number} of logbook {logbook_id}: {s3_key}')
+        print(f'Analyzing page {page_number} of upload {batch_id}: {s3_key}')
 
         try:
-            process_page(logbook_id, page_id, page_number, s3_key)
+            process_page(batch_id, page_id, page_number, s3_key)
         except Exception as e:
             print(f'ERROR processing page {page_id}: {e}')
             mark_page_failed(page_id)
             raise
 
 
-def process_page(logbook_id: str, page_id: str, page_number: int, s3_key: str):
+def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
     """Download page image, extract with Gemini, write results to DB."""
     conn = get_connection()
 
     # Mark page as processing
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE logbook_pages SET extraction_status = 'processing' WHERE id = %s",
+            "UPDATE upload_pages SET extraction_status = 'processing' WHERE id = %s",
             (page_id,)
         )
         conn.commit()
@@ -102,19 +102,19 @@ def process_page(logbook_id: str, page_id: str, page_number: int, s3_key: str):
     # Store raw extraction
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE logbook_pages SET raw_extraction = %s, page_type = %s,
+            """UPDATE upload_pages SET raw_extraction = %s, page_type = %s,
                extraction_model = 'gemini-2.5-flash', extraction_timestamp = NOW()
                WHERE id = %s""",
             (json.dumps(extraction), extraction.get('pageType', 'other'), page_id)
         )
         conn.commit()
 
-    # Get aircraft_id from logbook
+    # Get aircraft_id from upload batch
     rows = execute_query(
-        "SELECT aircraft_id FROM logbook_documents WHERE id = %s", (logbook_id,)
+        "SELECT aircraft_id FROM upload_batches WHERE id = %s", (batch_id,)
     )
     if not rows:
-        raise ValueError(f'Logbook {logbook_id} not found')
+        raise ValueError(f'Upload batch {batch_id} not found')
     aircraft_id = rows[0]['aircraft_id']
 
     # Process each entry
@@ -126,13 +126,13 @@ def process_page(logbook_id: str, page_id: str, page_number: int, s3_key: str):
     needs_review = any(e.get('needsReview', False) for e in entries)
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE logbook_pages SET extraction_status = 'completed', needs_review = %s WHERE id = %s""",
+            """UPDATE upload_pages SET extraction_status = 'completed', needs_review = %s WHERE id = %s""",
             (needs_review, page_id)
         )
         conn.commit()
 
-    # Check if all pages are done → mark logbook complete
-    check_logbook_completion(conn, logbook_id)
+    # Check if all pages are done → mark upload batch complete
+    check_batch_completion(conn, batch_id)
 
     print(f'Page {page_id}: extracted {len(entries)} entries')
 
@@ -318,24 +318,29 @@ def generate_embedding(entry_id: str, text: str):
         conn.commit()
 
 
-def check_logbook_completion(conn, logbook_id: str):
-    """If all pages are done, mark the logbook as completed."""
+def check_batch_completion(conn, batch_id: str):
+    """If all pages are done, mark the upload batch as completed/completed_with_errors/failed."""
     with conn.cursor() as cur:
         cur.execute(
             """SELECT COUNT(*) AS total,
                       COUNT(*) FILTER (WHERE extraction_status IN ('completed', 'skipped')) AS done,
                       COUNT(*) FILTER (WHERE extraction_status = 'failed') AS failed
-               FROM logbook_pages WHERE document_id = %s""",
-            (logbook_id,)
+               FROM upload_pages WHERE document_id = %s""",
+            (batch_id,)
         )
         row = cur.fetchone()
         total, done, failed = row
 
         if total > 0 and done + failed == total:
-            status = 'completed' if failed == 0 else 'failed'
+            if failed == 0:
+                status = 'completed'
+            elif done == 0:
+                status = 'failed'
+            else:
+                status = 'completed_with_errors'
             cur.execute(
-                "UPDATE logbook_documents SET processing_status = %s, updated_at = NOW() WHERE id = %s",
-                (status, logbook_id)
+                "UPDATE upload_batches SET processing_status = %s, updated_at = NOW() WHERE id = %s",
+                (status, batch_id)
             )
             conn.commit()
 
@@ -346,7 +351,7 @@ def mark_page_failed(page_id: str):
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE logbook_pages SET extraction_status = 'failed' WHERE id = %s",
+                "UPDATE upload_pages SET extraction_status = 'failed' WHERE id = %s",
                 (page_id,)
             )
             conn.commit()

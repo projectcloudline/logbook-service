@@ -171,6 +171,7 @@ export class LogbookServiceStack extends cdk.Stack {
     appSecrets.grantRead(apiFunction); // for RAG endpoint
 
     analyzeQueue.grantSendMessages(splitFunction);
+    analyzeQueue.grantSendMessages(apiFunction);
     analyzeQueue.grantConsumeMessages(analyzeFunction);
 
     // ─── Event Sources ─────────────────────────────────────────
@@ -214,21 +215,32 @@ export class LogbookServiceStack extends cdk.Stack {
 
     const lambdaIntegration = new apigateway.LambdaIntegration(apiFunction);
 
-    // POST /logbooks/upload
-    const logbooks = api.root.addResource('logbooks');
-    const upload = logbooks.addResource('upload');
-    upload.addMethod('POST', lambdaIntegration, { apiKeyRequired: true });
+    // POST /uploads
+    const uploads = api.root.addResource('uploads');
+    uploads.addMethod('POST', lambdaIntegration, { apiKeyRequired: true });
 
-    // GET /logbooks/{id}/status
-    const logbookById = logbooks.addResource('{id}');
-    const status = logbookById.addResource('status');
+    // /uploads/{id}/*
+    const uploadById = uploads.addResource('{id}');
+
+    // GET /uploads/{id}/status
+    const status = uploadById.addResource('status');
     status.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+
+    // POST /uploads/{id}/process
+    const process = uploadById.addResource('process');
+    process.addMethod('POST', lambdaIntegration, { apiKeyRequired: true });
+
+    // GET /uploads/{id}/pages/{pageNumber}/image
+    const uploadPages = uploadById.addResource('pages');
+    const uploadPageByNumber = uploadPages.addResource('{pageNumber}');
+    const pageImage = uploadPageByNumber.addResource('image');
+    pageImage.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
 
     // /aircraft/{tailNumber}/*
     const aircraft = api.root.addResource('aircraft');
     const byTail = aircraft.addResource('{tailNumber}');
-    const tailLogbooks = byTail.addResource('logbooks');
-    tailLogbooks.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+    const tailUploads = byTail.addResource('uploads');
+    tailUploads.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
 
     const summary = byTail.addResource('summary');
     summary.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });

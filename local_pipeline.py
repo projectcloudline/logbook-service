@@ -116,17 +116,17 @@ def patch_boto_clients(endpoint_url):
     boto3.client = patched_client
 
 
-def upload_pdf(s3, pdf_path, logbook_id):
+def upload_pdf(s3, pdf_path, batch_id):
     """Upload a PDF to LocalStack S3."""
     filename = os.path.basename(pdf_path)
-    s3_key = f'uploads/{logbook_id}/{filename}'
+    s3_key = f'uploads/{batch_id}/{filename}'
     s3.upload_file(pdf_path, BUCKET_NAME, s3_key, ExtraArgs={'ContentType': 'application/pdf'})
     print(f'Uploaded {pdf_path} → s3://{BUCKET_NAME}/{s3_key}')
     return s3_key
 
 
-def create_logbook_record(tail_number, logbook_type, filename, logbook_id, s3_key):
-    """Create aircraft + logbook_documents records in DB."""
+def create_upload_record(tail_number, logbook_type, filename, batch_id, s3_key):
+    """Create aircraft + upload_batches records in DB."""
     from shared.db import execute_insert
 
     aircraft_id = execute_insert(
@@ -137,12 +137,12 @@ def create_logbook_record(tail_number, logbook_type, filename, logbook_id, s3_ke
     )
 
     execute_insert(
-        """INSERT INTO logbook_documents (id, aircraft_id, logbook_type, source_filename, s3_key, processing_status)
+        """INSERT INTO upload_batches (id, aircraft_id, logbook_type, source_filename, s3_key, processing_status)
            VALUES (%s, %s, %s, %s, %s, 'pending') RETURNING id""",
-        (logbook_id, aircraft_id, logbook_type, filename, s3_key)
+        (batch_id, aircraft_id, logbook_type, filename, s3_key)
     )
 
-    print(f'Created logbook record: {logbook_id} for {tail_number}')
+    print(f'Created upload record: {batch_id} for {tail_number}')
     return aircraft_id
 
 
@@ -275,7 +275,7 @@ def main():
         sys.exit(1)
 
     tail_number = args.tail_number.upper()
-    logbook_id = str(uuid.uuid4())
+    batch_id = str(uuid.uuid4())
 
     # Setup
     s3, sqs, queue_url = setup_localstack()
@@ -285,11 +285,11 @@ def main():
     import importlib
 
     # Upload
-    s3_key = upload_pdf(s3, pdf_path, logbook_id)
-    create_logbook_record(tail_number, args.logbook_type, os.path.basename(pdf_path), logbook_id, s3_key)
+    s3_key = upload_pdf(s3, pdf_path, batch_id)
+    create_upload_record(tail_number, args.logbook_type, os.path.basename(pdf_path), batch_id, s3_key)
 
     # Split
-    run_split(s3_key, logbook_id)
+    run_split(s3_key, batch_id)
 
     # Analyze
     if args.skip_analyze:

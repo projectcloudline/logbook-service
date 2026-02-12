@@ -4,18 +4,24 @@ info:
   description: |
     Aircraft maintenance logbook digitization and query API.
 
-    Upload scanned logbook PDFs, automatically extract maintenance entries via AI,
+    Upload scanned logbook PDFs or phone photos, automatically extract maintenance entries via AI,
     and query structured maintenance history per aircraft tail number.
 
     ## Authentication
     All endpoints require an API key passed via the `x-api-key` header.
 
-    ## Workflow
-    1. **Upload** a logbook PDF via `POST /logbooks/upload` — returns a presigned S3 URL
-    2. **PUT** the PDF to the presigned URL
-    3. **Poll** `GET /logbooks/{id}/status` until processing completes
+    ## Workflow — PDF Upload
+    1. **Upload** a logbook PDF via `POST /uploads` — returns a presigned S3 URL
+    2. **PUT** the PDF to the presigned URL (triggers automatic splitting + analysis)
+    3. **Poll** `GET /uploads/{id}/status` until processing completes
     4. **Query** extracted data via the `/aircraft/{tailNumber}/*` endpoints
-  version: 1.0.0
+
+    ## Workflow — Multi-Image Upload
+    1. **Upload** with `pageCount` in `POST /uploads` — returns presigned URLs per page
+    2. **PUT** each page image to its presigned URL
+    3. **Process** `POST /uploads/{id}/process` to kick off analysis
+    4. **Poll** `GET /uploads/{id}/status` until processing completes
+  version: 2.0.0
   contact:
     name: CloudLine
     url: https://cloudline.aero
@@ -28,7 +34,7 @@ security:
   - apiKey: []
 
 tags:
-  - name: Logbooks
+  - name: Uploads
     description: Upload and track logbook processing
   - name: Aircraft
     description: Query maintenance data by tail number
@@ -36,15 +42,19 @@ tags:
     description: Natural language queries over maintenance records
 
 paths:
-  /logbooks/upload:
+  /uploads:
     post:
-      operationId: uploadLogbook
-      tags: [Logbooks]
-      summary: Upload a logbook PDF
+      operationId: createUpload
+      tags: [Uploads]
+      summary: Create an upload
       description: |
-        Creates a logbook document record and returns a presigned S3 URL for uploading
-        the PDF. After uploading, the service automatically splits the PDF into pages
-        and queues each page for AI extraction.
+        Creates an upload batch and returns presigned S3 URL(s).
+
+        **PDF mode** (default): Returns a single presigned URL. Uploading the PDF
+        automatically triggers splitting and analysis.
+
+        **Multi-image mode** (`pageCount` present): Returns one presigned URL per page.
+        After uploading all images, call `POST /uploads/{id}/process` to start analysis.
       requestBody:
         required: true
         content:
@@ -57,80 +67,176 @@ paths:
                   type: string
                   description: Aircraft registration / N-number
                   example: N69ZA
-                logbookType:
+                logType:
                   type: string
                   enum: [airframe, engine, propeller, avionics, appliance]
-                  default: airframe
+                  nullable: true
+                  description: Log type (optional)
                 filename:
                   type: string
                   description: Original filename
                   default: logbook.pdf
+                pageCount:
+                  type: integer
+                  minimum: 1
+                  maximum: 500
+                  description: Number of page images (multi-image mode). Omit for PDF mode.
       responses:
         '200':
-          description: Logbook created — upload the PDF to the presigned URL
+          description: Upload created
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  logbookId:
-                    type: string
-                    format: uuid
-                  uploadUrl:
-                    type: string
-                    format: uri
-                    description: Presigned S3 PUT URL (expires in 1 hour)
-                  s3Key:
-                    type: string
+                oneOf:
+                  - $ref: '#/components/schemas/PdfUploadResponse'
+                  - $ref: '#/components/schemas/MultiImageUploadResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
 
-  /logbooks/{id}/status:
+  /uploads/{id}/status:
     get:
-      operationId: getLogbookStatus
-      tags: [Logbooks]
-      summary: Get logbook processing status
-      description: Returns the processing status of a logbook, including page-level progress.
+      operationId: getUploadStatus
+      tags: [Uploads]
+      summary: Get upload processing status
+      description: Returns the processing status of an upload, including page-level progress.
       parameters:
-        - $ref: '#/components/parameters/logbookId'
+        - $ref: '#/components/parameters/uploadId'
       responses:
         '200':
-          description: Logbook status
+          description: Upload status
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  logbookId:
+                  uploadId:
                     type: string
                     format: uuid
                   status:
                     type: string
-                    enum: [pending, processing, completed, failed]
+                    enum: [pending, processing, completed, completed_with_errors, failed]
                   filename:
                     type: string
-                  logbookType:
+                  logType:
                     type: string
+                    nullable: true
+                  uploadType:
+                    type: string
+                    enum: [pdf, multi_image]
                   pageCount:
                     type: integer
                   completedPages:
                     type: integer
+                  failedPages:
+                    type: integer
+                  needsReviewPages:
+                    type: integer
+                  failedPageNumbers:
+                    type: array
+                    description: Page numbers that failed extraction (only present when > 0)
+                    items:
+                      type: integer
                   createdAt:
                     type: string
                     format: date-time
         '404':
           $ref: '#/components/responses/NotFound'
 
-  /aircraft/{tailNumber}/logbooks:
+  /uploads/{id}/process:
+    post:
+      operationId: processUpload
+      tags: [Uploads]
+      summary: Start processing a multi-image upload
+      description: |
+        Finalizes a multi-image upload: verifies all page images exist in S3,
+        creates page records, and queues each page for AI extraction.
+
+        Only valid for `multi_image` uploads in `pending` status.
+      parameters:
+        - $ref: '#/components/parameters/uploadId'
+      responses:
+        '200':
+          description: Processing started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uploadId:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [processing]
+                  pagesQueued:
+                    type: integer
+        '400':
+          description: Missing page images
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  missingPages:
+                    type: array
+                    items:
+                      type: integer
+        '409':
+          description: Upload not eligible for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /uploads/{id}/pages/{pageNumber}/image:
     get:
-      operationId: listLogbooks
+      operationId: getPageImage
+      tags: [Uploads]
+      summary: Get page image URL
+      description: Returns a presigned GET URL for a page image (1-hour expiry).
+      parameters:
+        - $ref: '#/components/parameters/uploadId'
+        - name: pageNumber
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Page image URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uploadId:
+                    type: string
+                    format: uuid
+                  pageNumber:
+                    type: integer
+                  imageUrl:
+                    type: string
+                    format: uri
+                    description: Presigned S3 GET URL (expires in 1 hour)
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /aircraft/{tailNumber}/uploads:
+    get:
+      operationId: listUploads
       tags: [Aircraft]
-      summary: List logbooks for an aircraft
+      summary: List uploads for an aircraft
       parameters:
         - $ref: '#/components/parameters/tailNumber'
       responses:
         '200':
-          description: List of logbooks
+          description: List of uploads
           content:
             application/json:
               schema:
@@ -138,10 +244,10 @@ paths:
                 properties:
                   tailNumber:
                     type: string
-                  logbooks:
+                  uploads:
                     type: array
                     items:
-                      $ref: '#/components/schemas/LogbookSummary'
+                      $ref: '#/components/schemas/UploadSummary'
 
   /aircraft/{tailNumber}/summary:
     get:
@@ -462,14 +568,14 @@ components:
         type: string
       description: Aircraft registration / N-number
       example: N69ZA
-    logbookId:
+    uploadId:
       name: id
       in: path
       required: true
       schema:
         type: string
         format: uuid
-      description: Logbook document ID
+      description: Upload batch ID
     page:
       name: page
       in: query
@@ -509,6 +615,46 @@ components:
                 type: string
 
   schemas:
+    PdfUploadResponse:
+      type: object
+      properties:
+        uploadId:
+          type: string
+          format: uuid
+        uploadType:
+          type: string
+          enum: [pdf]
+        uploadUrl:
+          type: string
+          format: uri
+          description: Presigned S3 PUT URL (expires in 1 hour)
+        s3Key:
+          type: string
+
+    MultiImageUploadResponse:
+      type: object
+      properties:
+        uploadId:
+          type: string
+          format: uuid
+        uploadType:
+          type: string
+          enum: [multi_image]
+        pageCount:
+          type: integer
+        uploads:
+          type: array
+          items:
+            type: object
+            properties:
+              pageNumber:
+                type: integer
+              uploadUrl:
+                type: string
+                format: uri
+              s3Key:
+                type: string
+
     Aircraft:
       type: object
       properties:
@@ -545,7 +691,7 @@ components:
           type: string
           format: date-time
 
-    LogbookSummary:
+    UploadSummary:
       type: object
       properties:
         id:
@@ -553,12 +699,16 @@ components:
           format: uuid
         logbook_type:
           type: string
+          nullable: true
           enum: [airframe, engine, propeller, avionics, appliance]
+        upload_type:
+          type: string
+          enum: [pdf, multi_image]
         source_filename:
           type: string
         processing_status:
           type: string
-          enum: [pending, processing, completed, failed]
+          enum: [pending, processing, completed, completed_with_errors, failed]
         page_count:
           type: integer
           nullable: true
@@ -624,13 +774,20 @@ components:
         inspection_type:
           type: string
           nullable: true
-          enum: [annual, 100hr, 50hr, progressive, altimeter_static, transponder, elt, other, null]
+          enum: [annual, 100hr, 50hr, progressive, altimeter_static, transponder, elt, other]
 
     EntryDetail:
       allOf:
         - $ref: '#/components/schemas/EntryListItem'
         - type: object
           properties:
+            aircraft_id:
+              type: string
+              format: uuid
+            page_id:
+              type: string
+              format: uuid
+              nullable: true
             time_since_overhaul:
               type: number
               nullable: true
@@ -657,6 +814,19 @@ components:
             review_status:
               type: string
               enum: [pending, approved, corrected, rejected]
+            reviewed_by:
+              type: string
+              nullable: true
+            reviewed_at:
+              type: string
+              format: date-time
+              nullable: true
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
             partsActions:
               type: array
               items:
@@ -672,6 +842,9 @@ components:
       type: object
       properties:
         id:
+          type: string
+          format: uuid
+        entry_id:
           type: string
           format: uuid
         action_type:
@@ -697,9 +870,13 @@ components:
         notes:
           type: string
           nullable: true
+        created_at:
+          type: string
+          format: date-time
 
     ADCompliance:
       type: object
+      description: AD compliance record. When returned from entry detail, also includes entry_id, aircraft_id, next_due_date, next_due_hours, created_at.
       properties:
         id:
           type: string
@@ -719,6 +896,7 @@ components:
           nullable: true
 
     ADComplianceRecord:
+      description: AD compliance record with joined maintenance entry context (from /ads endpoint)
       allOf:
         - $ref: '#/components/schemas/ADCompliance'
         - type: object
@@ -744,6 +922,7 @@ components:
     InspectionRecord:
       type: object
       nullable: true
+      description: When returned from entry detail, also includes aircraft_id, entry_id, created_at.
       properties:
         id:
           type: string
@@ -779,9 +958,11 @@ components:
         maintenance_narrative:
           type: string
           nullable: true
+          description: Joined from maintenance_entries (list endpoint only)
         shop_name:
           type: string
           nullable: true
+          description: Joined from maintenance_entries (list endpoint only)
 
     LifeLimitedPart:
       type: object
