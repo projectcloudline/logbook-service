@@ -4,16 +4,18 @@ import json
 import math
 import os
 import uuid
+from pathlib import Path
 import boto3
 
 # Shared modules (bundled at build time)
-from shared.db import execute_query, execute_insert, get_connection
+from shared.db import execute_query, execute_insert
 from shared.models import api_response
 
 s3 = boto3.client('s3')
-sqs = boto3.client('sqs')
 BUCKET = os.environ['BUCKET_NAME']
-ANALYZE_QUEUE_URL = os.environ.get('ANALYZE_QUEUE_URL', '')
+
+PDF_EXTENSIONS = {'.pdf'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif'}
 
 DEFAULT_PAGE_LIMIT = 25
 MAX_PAGE_LIMIT = 100
@@ -53,10 +55,6 @@ def handler(event, context):
         elif path == '/uploads/{id}/status' and method == 'GET':
             return handle_status(path_params['id'])
 
-        # POST /uploads/{id}/process
-        elif path == '/uploads/{id}/process' and method == 'POST':
-            return handle_process(path_params['id'])
-
         # GET /uploads/{id}/pages/{pageNumber}/image
         elif path == '/uploads/{id}/pages/{pageNumber}/image' and method == 'GET':
             return handle_page_image(path_params['id'], int(path_params['pageNumber']))
@@ -81,6 +79,10 @@ def handler(event, context):
         elif path == '/aircraft/{tailNumber}/entries/{entryId}' and method == 'GET':
             return handle_entry_detail(path_params['tailNumber'], path_params['entryId'])
 
+        # PATCH /aircraft/{tailNumber}/entries/{entryId}
+        elif path == '/aircraft/{tailNumber}/entries/{entryId}' and method == 'PATCH':
+            return handle_update_entry(path_params['tailNumber'], path_params['entryId'], event)
+
         # GET /aircraft/{tailNumber}/inspections
         elif path == '/aircraft/{tailNumber}/inspections' and method == 'GET':
             return handle_inspections(path_params['tailNumber'], event)
@@ -103,17 +105,32 @@ def handler(event, context):
 def handle_upload(event):
     """Create an upload batch and return presigned upload URL(s).
 
-    PDF mode (default): single presigned URL for a PDF, triggers split Lambda on upload.
-    Multi-image mode (pageCount present): presigned URLs per page image, requires POST /uploads/{id}/process.
+    Accepts a `files` array of {filename} objects. Mode is inferred:
+    - Single PDF → pdf mode, file goes to uploads/ prefix (triggers split Lambda)
+    - One or more images → multi_image mode, files go to pages/ prefix (triggers split Lambda on pages/)
     """
     body = json.loads(event.get('body') or '{}')
     tail_number = body.get('tailNumber', '').upper().strip()
     log_type = body.get('logType')
-    filename = body.get('filename', 'logbook.pdf')
-    page_count = body.get('pageCount')
+    files = body.get('files', [])
 
     if not tail_number:
         return api_response(400, {'error': 'tailNumber is required'})
+    if not files:
+        return api_response(400, {'error': 'files array is required'})
+    if len(files) > 500:
+        return api_response(400, {'error': 'Maximum 500 files per upload'})
+
+    # Classify files by extension
+    pdf_files = [f for f in files if Path(f.get('filename', '')).suffix.lower() in PDF_EXTENSIONS]
+    image_files = [f for f in files if Path(f.get('filename', '')).suffix.lower() in IMAGE_EXTENSIONS]
+
+    if pdf_files and image_files:
+        return api_response(400, {'error': 'Cannot mix PDF and image files in one upload'})
+    if not pdf_files and not image_files:
+        return api_response(400, {'error': 'Files must be PDF (.pdf) or images (.jpg, .jpeg, .png, etc.)'})
+    if len(pdf_files) > 1:
+        return api_response(400, {'error': 'Only one PDF per upload'})
 
     # Upsert aircraft
     aircraft_id = execute_insert(
@@ -125,36 +142,9 @@ def handle_upload(event):
 
     batch_id = str(uuid.uuid4())
 
-    if page_count:
-        # Multi-image upload mode
-        page_count = int(page_count)
-        if page_count < 1 or page_count > 500:
-            return api_response(400, {'error': 'pageCount must be between 1 and 500'})
-
-        execute_insert(
-            """INSERT INTO upload_batches (id, aircraft_id, logbook_type, upload_type, source_filename, page_count, processing_status)
-               VALUES (%s, %s, %s, 'multi_image', %s, %s, 'pending') RETURNING id""",
-            (batch_id, aircraft_id, log_type, filename, page_count)
-        )
-
-        uploads = []
-        for i in range(1, page_count + 1):
-            page_key = f'pages/{batch_id}/page_{i:04d}.jpg'
-            url = s3.generate_presigned_url(
-                'put_object',
-                Params={'Bucket': BUCKET, 'Key': page_key, 'ContentType': 'image/jpeg'},
-                ExpiresIn=3600,
-            )
-            uploads.append({'pageNumber': i, 'uploadUrl': url, 's3Key': page_key})
-
-        return api_response(200, {
-            'uploadId': batch_id,
-            'uploadType': 'multi_image',
-            'pageCount': page_count,
-            'uploads': uploads,
-        })
-    else:
-        # PDF upload mode (existing flow)
+    if pdf_files:
+        # PDF mode — single file to uploads/ prefix, triggers split Lambda
+        filename = pdf_files[0].get('filename', 'logbook.pdf')
         s3_key = f'uploads/{batch_id}/{filename}'
         execute_insert(
             """INSERT INTO upload_batches (id, aircraft_id, logbook_type, upload_type, source_filename, s3_key, processing_status)
@@ -171,8 +161,48 @@ def handle_upload(event):
         return api_response(200, {
             'uploadId': batch_id,
             'uploadType': 'pdf',
-            'uploadUrl': upload_url,
-            's3Key': s3_key,
+            'files': [{'filename': filename, 'uploadUrl': upload_url, 's3Key': s3_key}],
+        })
+    else:
+        # Multi-image mode — files to pages/ prefix, each triggers split Lambda
+        page_count = len(image_files)
+        source_name = image_files[0].get('filename', 'page.jpg') if page_count == 1 else f'{page_count} images'
+
+        execute_insert(
+            """INSERT INTO upload_batches (id, aircraft_id, logbook_type, upload_type, source_filename, page_count, processing_status)
+               VALUES (%s, %s, %s, 'multi_image', %s, %s, 'pending') RETURNING id""",
+            (batch_id, aircraft_id, log_type, source_name, page_count)
+        )
+
+        # Create upload_pages records upfront (we know all pages)
+        result_files = []
+        for i, f in enumerate(image_files, 1):
+            filename = f.get('filename', f'page_{i:04d}.jpg')
+            page_key = f'pages/{batch_id}/page_{i:04d}.jpg'
+
+            execute_insert(
+                """INSERT INTO upload_pages (document_id, page_number, image_path, extraction_status)
+                   VALUES (%s, %s, %s, 'pending') RETURNING id""",
+                (batch_id, i, page_key)
+            )
+
+            url = s3.generate_presigned_url(
+                'put_object',
+                Params={'Bucket': BUCKET, 'Key': page_key, 'ContentType': 'image/jpeg'},
+                ExpiresIn=3600,
+            )
+            result_files.append({
+                'filename': filename,
+                'pageNumber': i,
+                'uploadUrl': url,
+                's3Key': page_key,
+            })
+
+        return api_response(200, {
+            'uploadId': batch_id,
+            'uploadType': 'multi_image',
+            'pageCount': page_count,
+            'files': result_files,
         })
 
 
@@ -303,75 +333,6 @@ def handle_summary(tail_number):
         'lastOilChange': oil[0] if oil else None,
         'totalTime': tt[0]['flight_time'] if tt else None,
         'upcomingExpirations': expirations,
-    })
-
-
-def handle_process(batch_id):
-    """Finalize a multi-image upload: verify images, create page records, queue for analysis."""
-    conn = get_connection()
-
-    # Atomic status transition: pending → processing (only for multi_image uploads)
-    with conn.cursor() as cur:
-        cur.execute(
-            """UPDATE upload_batches SET processing_status = 'processing', updated_at = NOW()
-               WHERE id = %s AND upload_type = 'multi_image' AND processing_status = 'pending'
-               RETURNING id, page_count""",
-            (batch_id,)
-        )
-        row = cur.fetchone()
-        conn.commit()
-
-    if not row:
-        return api_response(409, {
-            'error': 'Upload not found, not a multi-image upload, or already processing'
-        })
-
-    page_count = row[1]
-
-    # Verify all page images exist in S3
-    prefix = f'pages/{batch_id}/'
-    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
-    found_keys = {obj['Key'] for obj in resp.get('Contents', [])}
-    expected_keys = {f'pages/{batch_id}/page_{i:04d}.jpg' for i in range(1, page_count + 1)}
-    missing = expected_keys - found_keys
-
-    if missing:
-        # Roll back to pending
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE upload_batches SET processing_status = 'pending', updated_at = NOW() WHERE id = %s",
-                (batch_id,)
-            )
-            conn.commit()
-        missing_pages = sorted(int(k.split('_')[-1].split('.')[0]) for k in missing)
-        return api_response(400, {
-            'error': f'Missing {len(missing)} page image(s)',
-            'missingPages': missing_pages,
-        })
-
-    # Create upload_pages records and queue SQS messages
-    for i in range(1, page_count + 1):
-        page_key = f'pages/{batch_id}/page_{i:04d}.jpg'
-        page_id = execute_insert(
-            """INSERT INTO upload_pages (document_id, page_number, image_path, extraction_status)
-               VALUES (%s, %s, %s, 'pending') RETURNING id""",
-            (batch_id, i, page_key)
-        )
-
-        sqs.send_message(
-            QueueUrl=ANALYZE_QUEUE_URL,
-            MessageBody=json.dumps({
-                'uploadId': batch_id,
-                'pageId': page_id,
-                'pageNumber': i,
-                's3Key': page_key,
-            }),
-        )
-
-    return api_response(200, {
-        'uploadId': batch_id,
-        'status': 'processing',
-        'pagesQueued': page_count,
     })
 
 
@@ -523,6 +484,7 @@ def handle_entries(tail_number, event):
     entry_type = params.get('type')
     date_from = params.get('dateFrom')
     date_to = params.get('dateTo')
+    needs_review = params.get('needsReview')
 
     where_clauses = ["me.aircraft_id = %s"]
     query_params = [aid]
@@ -536,6 +498,8 @@ def handle_entries(tail_number, event):
     if date_to:
         where_clauses.append("me.entry_date <= %s")
         query_params.append(date_to)
+    if needs_review and needs_review.lower() == 'true':
+        where_clauses.append("me.needs_review = TRUE")
 
     where_sql = " AND ".join(where_clauses)
 
@@ -551,6 +515,7 @@ def handle_entries(tail_number, event):
         f"""SELECT me.id, me.entry_type, me.entry_date, me.hobbs_time, me.tach_time,
                    me.flight_time, me.shop_name, me.mechanic_name,
                    me.maintenance_narrative, me.confidence_score, me.needs_review,
+                   me.review_status, me.missing_data,
                    ir.inspection_type
             FROM maintenance_entries me
             LEFT JOIN inspection_records ir ON ir.entry_id = me.id
@@ -610,6 +575,80 @@ def handle_entry_detail(tail_number, entry_id):
         'tailNumber': tail_number.upper(),
         'entry': entry,
     })
+
+
+PATCHABLE_FIELDS = {
+    'entryDate': 'entry_date',
+    'entryType': 'entry_type',
+    'hobbsTime': 'hobbs_time',
+    'tachTime': 'tach_time',
+    'flightTime': 'flight_time',
+    'timeSinceOverhaul': 'time_since_overhaul',
+    'shopName': 'shop_name',
+    'shopAddress': 'shop_address',
+    'shopPhone': 'shop_phone',
+    'repairStationNumber': 'repair_station_number',
+    'mechanicName': 'mechanic_name',
+    'mechanicCertificate': 'mechanic_certificate',
+    'workOrderNumber': 'work_order_number',
+    'maintenanceNarrative': 'maintenance_narrative',
+}
+
+
+def handle_update_entry(tail_number, entry_id, event):
+    """Update an entry's fields and/or review status."""
+    aid, err = _get_aircraft_id(tail_number)
+    if err:
+        return err
+
+    body = json.loads(event.get('body') or '{}')
+    if not body:
+        return api_response(400, {'error': 'Request body is required'})
+
+    review_status = body.get('reviewStatus')
+    reviewed_by = body.get('reviewedBy')
+
+    if review_status and review_status not in ('approved', 'corrected', 'rejected'):
+        return api_response(400, {'error': 'reviewStatus must be approved, corrected, or rejected'})
+
+    # Build SET clauses from patchable fields
+    set_clauses = []
+    values = []
+
+    for camel, col in PATCHABLE_FIELDS.items():
+        if camel in body:
+            set_clauses.append(f'{col} = %s')
+            values.append(body[camel])
+
+    if review_status:
+        set_clauses.append('review_status = %s')
+        values.append(review_status)
+        set_clauses.append('reviewed_at = NOW()')
+        if reviewed_by:
+            set_clauses.append('reviewed_by = %s')
+            values.append(reviewed_by)
+        # Clear needs_review when approving or rejecting
+        if review_status in ('approved', 'rejected'):
+            set_clauses.append('needs_review = FALSE')
+
+    if not set_clauses:
+        return api_response(400, {'error': 'No fields to update'})
+
+    set_clauses.append('updated_at = NOW()')
+    values.extend([entry_id, aid])
+
+    rows = execute_query(
+        f"""UPDATE maintenance_entries
+            SET {', '.join(set_clauses)}
+            WHERE id = %s AND aircraft_id = %s
+            RETURNING id""",
+        values
+    )
+
+    if not rows:
+        return api_response(404, {'error': 'Entry not found'})
+
+    return handle_entry_detail(tail_number, entry_id)
 
 
 def handle_inspections(tail_number, event):

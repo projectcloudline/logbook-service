@@ -109,17 +109,23 @@ def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
         )
         conn.commit()
 
-    # Get aircraft_id from upload batch
+    # Get aircraft_id and registration from upload batch
     rows = execute_query(
-        "SELECT aircraft_id FROM upload_batches WHERE id = %s", (batch_id,)
+        """SELECT ub.aircraft_id, a.registration
+           FROM upload_batches ub
+           JOIN aircraft a ON ub.aircraft_id = a.id
+           WHERE ub.id = %s""",
+        (batch_id,)
     )
     if not rows:
         raise ValueError(f'Upload batch {batch_id} not found')
     aircraft_id = rows[0]['aircraft_id']
+    expected_registration = rows[0]['registration']
 
     # Process each entry
     entries = extraction.get('entries', [])
     for entry in entries:
+        check_registration_mismatch(entry, expected_registration)
         save_entry(conn, aircraft_id, page_id, entry)
 
     # Mark page complete
@@ -135,6 +141,24 @@ def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
     check_batch_completion(conn, batch_id)
 
     print(f'Page {page_id}: extracted {len(entries)} entries')
+
+
+def check_registration_mismatch(entry: dict, expected_registration: str):
+    """Flag entry for review if extracted registration doesn't match the expected aircraft."""
+    extracted = entry.get('aircraftRegistration')
+    if not extracted:
+        return
+
+    # Normalize for comparison (strip whitespace, uppercase, ignore dashes)
+    normalize = lambda s: s.upper().strip().replace('-', '')
+    if normalize(extracted) != normalize(expected_registration):
+        entry['needsReview'] = True
+        note = f'Registration mismatch: extracted "{extracted}", expected "{expected_registration}"'
+        entry['extractionNotes'] = (entry.get('extractionNotes') or '') + note
+        missing = entry.get('missingData') or []
+        missing.append('registration_mismatch')
+        entry['missingData'] = missing
+        print(f'  WARNING: {note}')
 
 
 def normalize_entry_type(entry: dict):

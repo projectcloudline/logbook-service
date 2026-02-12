@@ -54,12 +54,12 @@ app = Flask(__name__)
 ROUTE_PATTERNS = [
     ('POST', '/uploads', '/uploads'),
     ('GET',  r'/uploads/(?P<id>[^/]+)/status', '/uploads/{id}/status'),
-    ('POST', r'/uploads/(?P<id>[^/]+)/process', '/uploads/{id}/process'),
     ('GET',  r'/uploads/(?P<id>[^/]+)/pages/(?P<pageNumber>[^/]+)/image', '/uploads/{id}/pages/{pageNumber}/image'),
     ('GET',  r'/aircraft/(?P<tailNumber>[^/]+)/uploads', '/aircraft/{tailNumber}/uploads'),
     ('GET',  r'/aircraft/(?P<tailNumber>[^/]+)/summary', '/aircraft/{tailNumber}/summary'),
     ('POST', r'/aircraft/(?P<tailNumber>[^/]+)/query', '/aircraft/{tailNumber}/query'),
     ('GET',  r'/aircraft/(?P<tailNumber>[^/]+)/entries/(?P<entryId>[^/]+)', '/aircraft/{tailNumber}/entries/{entryId}'),
+    ('PATCH', r'/aircraft/(?P<tailNumber>[^/]+)/entries/(?P<entryId>[^/]+)', '/aircraft/{tailNumber}/entries/{entryId}'),
     ('GET',  r'/aircraft/(?P<tailNumber>[^/]+)/entries', '/aircraft/{tailNumber}/entries'),
     ('GET',  r'/aircraft/(?P<tailNumber>[^/]+)/inspections', '/aircraft/{tailNumber}/inspections'),
     ('GET',  r'/aircraft/(?P<tailNumber>[^/]+)/ads', '/aircraft/{tailNumber}/ads'),

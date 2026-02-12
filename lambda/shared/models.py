@@ -26,6 +26,22 @@ class AircraftSummary:
         return asdict(self)
 
 
+def _json_serial(obj):
+    """JSON serializer for types not handled by default encoder."""
+    from decimal import Decimal
+    from datetime import datetime, date
+    from uuid import UUID
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, UUID):
+        return str(obj)
+    return str(obj)
+
+
 def api_response(status_code: int, body: dict) -> dict:
     """Standard API Gateway Lambda proxy response."""
     import json
@@ -35,5 +51,5 @@ def api_response(status_code: int, body: dict) -> dict:
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
         },
-        'body': json.dumps(body, default=str),
+        'body': json.dumps(body, default=_json_serial),
     }

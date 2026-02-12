@@ -171,7 +171,6 @@ export class LogbookServiceStack extends cdk.Stack {
     appSecrets.grantRead(apiFunction); // for RAG endpoint
 
     analyzeQueue.grantSendMessages(splitFunction);
-    analyzeQueue.grantSendMessages(apiFunction);
     analyzeQueue.grantConsumeMessages(analyzeFunction);
 
     // ─── Event Sources ─────────────────────────────────────────
@@ -179,6 +178,12 @@ export class LogbookServiceStack extends cdk.Stack {
       s3.EventType.OBJECT_CREATED_PUT,
       new s3n.LambdaDestination(splitFunction),
       { prefix: 'uploads/' }
+    );
+
+    bucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED_PUT,
+      new s3n.LambdaDestination(splitFunction),
+      { prefix: 'pages/' }
     );
 
     analyzeFunction.addEventSource(
@@ -226,10 +231,6 @@ export class LogbookServiceStack extends cdk.Stack {
     const status = uploadById.addResource('status');
     status.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
 
-    // POST /uploads/{id}/process
-    const process = uploadById.addResource('process');
-    process.addMethod('POST', lambdaIntegration, { apiKeyRequired: true });
-
     // GET /uploads/{id}/pages/{pageNumber}/image
     const uploadPages = uploadById.addResource('pages');
     const uploadPageByNumber = uploadPages.addResource('{pageNumber}');
@@ -253,6 +254,7 @@ export class LogbookServiceStack extends cdk.Stack {
 
     const entryById = entries.addResource('{entryId}');
     entryById.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });
+    entryById.addMethod('PATCH', lambdaIntegration, { apiKeyRequired: true });
 
     const inspections = byTail.addResource('inspections');
     inspections.addMethod('GET', lambdaIntegration, { apiKeyRequired: true });

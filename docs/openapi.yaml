@@ -17,10 +17,9 @@ info:
     4. **Query** extracted data via the `/aircraft/{tailNumber}/*` endpoints
 
     ## Workflow — Multi-Image Upload
-    1. **Upload** with `pageCount` in `POST /uploads` — returns presigned URLs per page
-    2. **PUT** each page image to its presigned URL
-    3. **Process** `POST /uploads/{id}/process` to kick off analysis
-    4. **Poll** `GET /uploads/{id}/status` until processing completes
+    1. **Upload** with image files in `POST /uploads` — returns presigned URLs per page
+    2. **PUT** each page image to its presigned URL (each triggers analysis automatically)
+    3. **Poll** `GET /uploads/{id}/status` until processing completes
   version: 2.0.0
   contact:
     name: CloudLine
@@ -50,18 +49,18 @@ paths:
       description: |
         Creates an upload batch and returns presigned S3 URL(s).
 
-        **PDF mode** (default): Returns a single presigned URL. Uploading the PDF
-        automatically triggers splitting and analysis.
+        Mode is inferred from the files provided:
+        - **Single PDF** → PDF mode. Uploading triggers automatic splitting and analysis.
+        - **One or more images** → Multi-image mode. Each upload triggers analysis automatically.
 
-        **Multi-image mode** (`pageCount` present): Returns one presigned URL per page.
-        After uploading all images, call `POST /uploads/{id}/process` to start analysis.
+        Cannot mix PDFs and images in one upload. Maximum 500 files.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [tailNumber]
+              required: [tailNumber, files]
               properties:
                 tailNumber:
                   type: string
@@ -72,24 +71,26 @@ paths:
                   enum: [airframe, engine, propeller, avionics, appliance]
                   nullable: true
                   description: Log type (optional)
-                filename:
-                  type: string
-                  description: Original filename
-                  default: logbook.pdf
-                pageCount:
-                  type: integer
-                  minimum: 1
-                  maximum: 500
-                  description: Number of page images (multi-image mode). Omit for PDF mode.
+                files:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  description: Files to upload. Single PDF or one-or-more images.
+                  items:
+                    type: object
+                    required: [filename]
+                    properties:
+                      filename:
+                        type: string
+                        description: Original filename (extension determines file type)
+                        example: page_001.jpg
       responses:
         '200':
           description: Upload created
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/PdfUploadResponse'
-                  - $ref: '#/components/schemas/MultiImageUploadResponse'
+                $ref: '#/components/schemas/UploadResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
 
@@ -141,57 +142,6 @@ paths:
                     format: date-time
         '404':
           $ref: '#/components/responses/NotFound'
-
-  /uploads/{id}/process:
-    post:
-      operationId: processUpload
-      tags: [Uploads]
-      summary: Start processing a multi-image upload
-      description: |
-        Finalizes a multi-image upload: verifies all page images exist in S3,
-        creates page records, and queues each page for AI extraction.
-
-        Only valid for `multi_image` uploads in `pending` status.
-      parameters:
-        - $ref: '#/components/parameters/uploadId'
-      responses:
-        '200':
-          description: Processing started
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  uploadId:
-                    type: string
-                    format: uuid
-                  status:
-                    type: string
-                    enum: [processing]
-                  pagesQueued:
-                    type: integer
-        '400':
-          description: Missing page images
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-                  missingPages:
-                    type: array
-                    items:
-                      type: integer
-        '409':
-          description: Upload not eligible for processing
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
 
   /uploads/{id}/pages/{pageNumber}/image:
     get:
@@ -322,6 +272,11 @@ paths:
             type: string
             format: date
           description: Entries on or before this date
+        - name: needsReview
+          in: query
+          schema:
+            type: boolean
+          description: Filter to entries flagged for review
         - $ref: '#/components/parameters/page'
         - $ref: '#/components/parameters/limit'
       responses:
@@ -371,6 +326,95 @@ paths:
                     type: string
                   entry:
                     $ref: '#/components/schemas/EntryDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateEntry
+      tags: [Aircraft]
+      summary: Update entry and/or set review status
+      description: |
+        Correct extracted fields and/or set the review status. Used during the
+        review workflow to approve, correct, or reject AI-extracted entries.
+
+        Setting `reviewStatus` to `approved` or `rejected` automatically clears
+        the `needsReview` flag. Returns the full updated entry detail.
+      parameters:
+        - $ref: '#/components/parameters/tailNumber'
+        - name: entryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reviewStatus:
+                  type: string
+                  enum: [approved, corrected, rejected]
+                  description: Set the review status
+                reviewedBy:
+                  type: string
+                  description: Identifier of the reviewer
+                entryDate:
+                  type: string
+                  format: date
+                entryType:
+                  type: string
+                  enum: [maintenance, inspection, ad_compliance, other]
+                maintenanceNarrative:
+                  type: string
+                hobbsTime:
+                  type: number
+                  nullable: true
+                tachTime:
+                  type: number
+                  nullable: true
+                flightTime:
+                  type: number
+                  nullable: true
+                timeSinceOverhaul:
+                  type: number
+                  nullable: true
+                shopName:
+                  type: string
+                  nullable: true
+                shopAddress:
+                  type: string
+                  nullable: true
+                shopPhone:
+                  type: string
+                  nullable: true
+                repairStationNumber:
+                  type: string
+                  nullable: true
+                mechanicName:
+                  type: string
+                  nullable: true
+                mechanicCertificate:
+                  type: string
+                  nullable: true
+                workOrderNumber:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Updated entry detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tailNumber:
+                    type: string
+                  entry:
+                    $ref: '#/components/schemas/EntryDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -615,7 +659,7 @@ components:
                 type: string
 
   schemas:
-    PdfUploadResponse:
+    UploadResponse:
       type: object
       properties:
         uploadId:
@@ -623,35 +667,24 @@ components:
           format: uuid
         uploadType:
           type: string
-          enum: [pdf]
-        uploadUrl:
-          type: string
-          format: uri
-          description: Presigned S3 PUT URL (expires in 1 hour)
-        s3Key:
-          type: string
-
-    MultiImageUploadResponse:
-      type: object
-      properties:
-        uploadId:
-          type: string
-          format: uuid
-        uploadType:
-          type: string
-          enum: [multi_image]
+          enum: [pdf, multi_image]
         pageCount:
           type: integer
-        uploads:
+          description: Number of pages (multi-image only)
+        files:
           type: array
           items:
             type: object
             properties:
+              filename:
+                type: string
               pageNumber:
                 type: integer
+                description: Page number (multi-image only)
               uploadUrl:
                 type: string
                 format: uri
+                description: Presigned S3 PUT URL (expires in 1 hour)
               s3Key:
                 type: string
 
@@ -771,6 +804,14 @@ components:
           description: AI extraction confidence (0-1)
         needs_review:
           type: boolean
+        review_status:
+          type: string
+          enum: [pending, approved, corrected, rejected]
+        missing_data:
+          type: array
+          nullable: true
+          items:
+            type: string
         inspection_type:
           type: string
           nullable: true
