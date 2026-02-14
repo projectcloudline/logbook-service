@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from pathlib import Path
 import boto3
 
 from google import genai
@@ -66,13 +67,22 @@ def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
         conn.commit()
 
     # Download image
-    with tempfile.NamedTemporaryFile(suffix='.jpg') as tmp:
+    ext = Path(s3_key).suffix or '.jpg'
+    mime_map = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.png': 'image/png', '.gif': 'image/gif',
+        '.bmp': 'image/bmp', '.tiff': 'image/tiff', '.tif': 'image/tiff',
+        '.heic': 'image/heic', '.heif': 'image/heif',
+    }
+    mime_type = mime_map.get(ext.lower(), 'image/jpeg')
+
+    with tempfile.NamedTemporaryFile(suffix=ext) as tmp:
         s3.download_file(BUCKET, s3_key, tmp.name)
         image_bytes = open(tmp.name, 'rb').read()
 
     # Call Gemini
     client = get_gemini_client()
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg')
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
     response = client.models.generate_content(
         model='gemini-2.5-flash',
@@ -109,9 +119,9 @@ def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
         )
         conn.commit()
 
-    # Get aircraft_id and registration from upload batch
+    # Get aircraft_id and identity from upload batch
     rows = execute_query(
-        """SELECT ub.aircraft_id, a.registration
+        """SELECT ub.aircraft_id, a.registration, a.serial_number, a.make, a.model
            FROM upload_batches ub
            JOIN aircraft a ON ub.aircraft_id = a.id
            WHERE ub.id = %s""",
@@ -120,12 +130,17 @@ def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
     if not rows:
         raise ValueError(f'Upload batch {batch_id} not found')
     aircraft_id = rows[0]['aircraft_id']
-    expected_registration = rows[0]['registration']
+    expected = {
+        'registration': rows[0]['registration'],
+        'serial_number': rows[0]['serial_number'],
+        'make': rows[0]['make'],
+        'model': rows[0]['model'],
+    }
 
     # Process each entry
     entries = extraction.get('entries', [])
     for entry in entries:
-        check_registration_mismatch(entry, expected_registration)
+        check_aircraft_identity(entry, expected)
         save_entry(conn, aircraft_id, page_id, entry)
 
     # Mark page complete
@@ -143,20 +158,63 @@ def process_page(batch_id: str, page_id: str, page_number: int, s3_key: str):
     print(f'Page {page_id}: extracted {len(entries)} entries')
 
 
-def check_registration_mismatch(entry: dict, expected_registration: str):
-    """Flag entry for review if extracted registration doesn't match the expected aircraft."""
-    extracted = entry.get('aircraftRegistration')
-    if not extracted:
-        return
+def _normalize(s: str) -> str:
+    """Normalize a string for comparison."""
+    return s.upper().strip().replace('-', '').replace(' ', '')
 
-    # Normalize for comparison (strip whitespace, uppercase, ignore dashes)
-    normalize = lambda s: s.upper().strip().replace('-', '')
-    if normalize(extracted) != normalize(expected_registration):
+
+def _fuzzy_match(extracted: str, expected: str) -> bool:
+    """Check if two strings match fuzzily — either contains the other after normalization."""
+    a = _normalize(extracted)
+    b = _normalize(expected)
+    return a in b or b in a
+
+
+def check_aircraft_identity(entry: dict, expected: dict):
+    """Flag entry if extracted aircraft identity doesn't match FAA-sourced data.
+
+    Compares serial number and make/model. Serial alone isn't sufficient because
+    serials can overlap between manufacturers (e.g., serial #2 for both Cessna 172N
+    and Cirrus SR22).
+    """
+    expected_serial = expected.get('serial_number')
+    if not expected_serial:
+        return  # No FAA data to compare against
+
+    extracted_serial = entry.get('aircraftSerial')
+    if not extracted_serial:
+        return  # Gemini didn't extract a serial, nothing to validate
+
+    serial_match = _normalize(extracted_serial) == _normalize(expected_serial)
+
+    # Check make/model if available from both sides
+    extracted_make = entry.get('aircraftMake', '')
+    extracted_model = entry.get('aircraftModel', '')
+    expected_make = expected.get('make', '')
+    expected_model = expected.get('model', '')
+
+    make_match = True  # Default to true if either side is missing
+    model_match = True
+    if extracted_make and expected_make:
+        make_match = _fuzzy_match(extracted_make, expected_make)
+    if extracted_model and expected_model:
+        model_match = _fuzzy_match(extracted_model, expected_model)
+
+    # Flag if serial doesn't match, or if serial matches but make/model BOTH fail
+    if not serial_match or (not make_match and not model_match):
+        reasons = []
+        if not serial_match:
+            reasons.append(f'serial "{extracted_serial}" != "{expected_serial}"')
+        if not make_match:
+            reasons.append(f'make "{extracted_make}" !~ "{expected_make}"')
+        if not model_match:
+            reasons.append(f'model "{extracted_model}" !~ "{expected_model}"')
+
         entry['needsReview'] = True
-        note = f'Registration mismatch: extracted "{extracted}", expected "{expected_registration}"'
+        note = f'Aircraft identity mismatch: {", ".join(reasons)}'
         entry['extractionNotes'] = (entry.get('extractionNotes') or '') + note
         missing = entry.get('missingData') or []
-        missing.append('registration_mismatch')
+        missing.append('aircraft_identity_mismatch')
         entry['missingData'] = missing
         print(f'  WARNING: {note}')
 

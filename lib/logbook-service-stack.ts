@@ -44,6 +44,9 @@ export class LogbookServiceStack extends cdk.Stack {
     const appSecrets = secretsmanager.Secret.fromSecretNameV2(this, 'AppSecrets',
       'dev/forge/app/secrets'
     );
+    const faaRegistryApiKey = secretsmanager.Secret.fromSecretNameV2(this, 'FaaRegistryApiKey',
+      'staging/cloudline/faa-registry-api/api-key'
+    );
 
     // ─── S3 Bucket ─────────────────────────────────────────────
     const bucket = new s3.Bucket(this, 'LogbookBucket', {
@@ -101,7 +104,11 @@ export class LogbookServiceStack extends cdk.Stack {
       }),
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
-      environment: sharedEnv,
+      environment: {
+        ...sharedEnv,
+        FAA_REGISTRY_URL: 'https://faa-registry.staging.cloudline.aero',
+        FAA_REGISTRY_SECRET_ARN: faaRegistryApiKey.secretArn,
+      },
       ...lambdaVpcConfig,
     });
 
@@ -171,6 +178,7 @@ export class LogbookServiceStack extends cdk.Stack {
     dbSecret.grantRead(analyzeFunction);
     appSecrets.grantRead(analyzeFunction);
     appSecrets.grantRead(apiFunction); // for RAG endpoint
+    faaRegistryApiKey.grantRead(apiFunction);
 
     analyzeQueue.grantSendMessages(splitFunction);
     analyzeQueue.grantConsumeMessages(analyzeFunction);

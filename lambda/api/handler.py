@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import urllib.request
 import uuid
 from pathlib import Path
 import boto3
@@ -12,10 +13,53 @@ from shared.db import execute_query, execute_insert
 from shared.models import api_response
 
 s3 = boto3.client('s3')
+sm = boto3.client('secretsmanager', region_name='us-west-2')
 BUCKET = os.environ['BUCKET_NAME']
 
+_faa_api_key = None
+
+
+def get_faa_api_key():
+    global _faa_api_key
+    if _faa_api_key:
+        return _faa_api_key
+    secret_string = sm.get_secret_value(
+        SecretId=os.environ['FAA_REGISTRY_SECRET_ARN']
+    )['SecretString']
+    _faa_api_key = secret_string
+    return _faa_api_key
+
+
+def enrich_aircraft_from_faa(aircraft_id, tail_number):
+    """Look up aircraft in FAA registry and populate make/model/serial_number.
+
+    Non-blocking — logs a warning and returns on any failure.
+    """
+    try:
+        api_key = get_faa_api_key()
+        url = f"{os.environ['FAA_REGISTRY_URL']}/registry/{tail_number}"
+        req = urllib.request.Request(url, headers={'x-api-key': api_key})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        execute_insert(
+            """UPDATE aircraft SET make = %s, model = %s, serial_number = %s, updated_at = NOW()
+               WHERE id = %s RETURNING id""",
+            (data.get('manufacturer'), data.get('model'), data.get('serialNumber'), aircraft_id)
+        )
+    except Exception as e:
+        print(f'WARNING: FAA enrichment failed for {tail_number}: {e}')
+
+
 PDF_EXTENSIONS = {'.pdf'}
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.heic', '.heif'}
+
+CONTENT_TYPE_MAP = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.png': 'image/png', '.gif': 'image/gif',
+    '.bmp': 'image/bmp', '.tiff': 'image/tiff', '.tif': 'image/tiff',
+    '.heic': 'image/heic', '.heif': 'image/heif',
+    '.pdf': 'application/pdf',
+}
 
 DEFAULT_PAGE_LIMIT = 25
 MAX_PAGE_LIMIT = 100
@@ -144,6 +188,9 @@ def handle_upload(event):
         (tail_number,)
     )
 
+    # Enrich with FAA registry data (make/model/serial)
+    enrich_aircraft_from_faa(aircraft_id, tail_number)
+
     batch_id = str(uuid.uuid4())
 
     if pdf_files:
@@ -158,7 +205,7 @@ def handle_upload(event):
 
         upload_url = s3.generate_presigned_url(
             'put_object',
-            Params={'Bucket': BUCKET, 'Key': s3_key, 'ContentType': 'application/pdf'},
+            Params={'Bucket': BUCKET, 'Key': s3_key, 'ContentType': CONTENT_TYPE_MAP.get('.pdf', 'application/pdf')},
             ExpiresIn=3600,
         )
 
@@ -182,7 +229,9 @@ def handle_upload(event):
         result_files = []
         for i, f in enumerate(image_files, 1):
             filename = f.get('filename', f'page_{i:04d}.jpg')
-            page_key = f'pages/{batch_id}/page_{i:04d}.jpg'
+            ext = Path(filename).suffix.lower()
+            content_type = CONTENT_TYPE_MAP.get(ext, 'image/jpeg')
+            page_key = f'pages/{batch_id}/page_{i:04d}{ext}'
 
             execute_insert(
                 """INSERT INTO upload_pages (document_id, page_number, image_path, extraction_status)
@@ -192,7 +241,7 @@ def handle_upload(event):
 
             url = s3.generate_presigned_url(
                 'put_object',
-                Params={'Bucket': BUCKET, 'Key': page_key, 'ContentType': 'image/jpeg'},
+                Params={'Bucket': BUCKET, 'Key': page_key, 'ContentType': content_type},
                 ExpiresIn=3600,
             )
             result_files.append({

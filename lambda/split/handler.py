@@ -18,7 +18,7 @@ sqs = boto3.client('sqs')
 BUCKET = os.environ['BUCKET_NAME']
 QUEUE_URL = os.environ['ANALYZE_QUEUE_URL']
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.heic', '.heif'}
 
 
 def handler(event, context):
