@@ -5,6 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"net/url"
@@ -15,6 +19,9 @@ import (
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 
 	"github.com/projectcloudline/logbook-service/internal/awsutil"
 	"github.com/projectcloudline/logbook-service/internal/db"
@@ -34,6 +41,8 @@ type Handler struct {
 	queueURL string
 	// mutoolPath overrides the default mutool binary path (for testing)
 	mutoolPath string
+	// heifConvertPath overrides the default heif-convert binary path (for testing)
+	heifConvertPath string
 }
 
 // Handle processes S3 PUT events for uploaded logbook files.
@@ -224,7 +233,16 @@ func (h *Handler) splitPDF(ctx context.Context, pdfPath, batchID, tmpdir string)
 func (h *Handler) handleSingleImage(ctx context.Context, localFile, batchID string) ([]string, error) {
 	s3Key := fmt.Sprintf("pages/%s/page_0001.jpg", batchID)
 
-	fileData, err := os.ReadFile(localFile)
+	ext := strings.ToLower(filepath.Ext(localFile))
+	normalizedFile, cleanup, err := h.normalizeImage(localFile, ext)
+	if err != nil {
+		return nil, fmt.Errorf("normalize image: %w", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	fileData, err := os.ReadFile(normalizedFile)
 	if err != nil {
 		return nil, fmt.Errorf("read image: %w", err)
 	}
@@ -234,6 +252,59 @@ func (h *Handler) handleSingleImage(ctx context.Context, localFile, batchID stri
 	}
 
 	return []string{s3Key}, nil
+}
+
+// normalizeImage converts non-JPEG/PNG images to JPEG so downstream Lambdas
+// can decode them with Go's standard image decoders.
+//
+// JPEG/PNG: returned as-is (natively supported everywhere).
+// HEIC/HEIF: converted via bundled heif-convert binary.
+// GIF/BMP/TIFF/WebP: decoded with Go stdlib/x decoders and re-encoded as JPEG.
+func (h *Handler) normalizeImage(localFile, ext string) (string, func(), error) {
+	switch ext {
+	case ".jpg", ".jpeg", ".png":
+		return localFile, nil, nil
+
+	case ".heic", ".heif":
+		outPath := strings.TrimSuffix(localFile, ext) + ".jpg"
+		heifConvert := h.getHeifConvertPath()
+		cmd := exec.Command(heifConvert, localFile, outPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return "", nil, fmt.Errorf("heif-convert: %w (%s)", err, string(output))
+		}
+		cleanup := func() { os.Remove(outPath) }
+		return outPath, cleanup, nil
+
+	case ".gif", ".bmp", ".tiff", ".tif", ".webp":
+		f, err := os.Open(localFile)
+		if err != nil {
+			return "", nil, fmt.Errorf("open %s: %w", ext, err)
+		}
+		defer f.Close()
+
+		img, _, err := image.Decode(f)
+		if err != nil {
+			return "", nil, fmt.Errorf("decode %s: %w", ext, err)
+		}
+
+		outPath := strings.TrimSuffix(localFile, ext) + ".jpg"
+		out, err := os.Create(outPath)
+		if err != nil {
+			return "", nil, fmt.Errorf("create output: %w", err)
+		}
+		if err := jpeg.Encode(out, img, &jpeg.Options{Quality: 90}); err != nil {
+			out.Close()
+			os.Remove(outPath)
+			return "", nil, fmt.Errorf("encode jpeg: %w", err)
+		}
+		out.Close()
+
+		cleanup := func() { os.Remove(outPath) }
+		return outPath, cleanup, nil
+
+	default:
+		return localFile, nil, nil
+	}
 }
 
 func (h *Handler) markFailed(ctx context.Context, batchID string) {
@@ -264,4 +335,18 @@ func (h *Handler) getMutoolPath() string {
 	}
 	// Fall back to PATH
 	return "mutool"
+}
+
+func (h *Handler) getHeifConvertPath() string {
+	if h.heifConvertPath != "" {
+		return h.heifConvertPath
+	}
+	// Look for bundled binary relative to Lambda executable
+	execDir, _ := os.Executable()
+	bundled := filepath.Join(filepath.Dir(execDir), "bin", "heif-convert-arm64")
+	if _, err := os.Stat(bundled); err == nil {
+		return bundled
+	}
+	// Fall back to PATH
+	return "heif-convert"
 }

@@ -4,7 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -641,4 +648,242 @@ func TestHandle_MultipleRecords(t *testing.T) {
 	if len(sqs.messages) != 2 {
 		t.Errorf("expected 2 SQS messages, got %d", len(sqs.messages))
 	}
+}
+
+// ─── Tests: normalizeImage ──────────────────────────────────────────────
+
+// createTestImage creates a small test image file in the given format.
+func createTestImage(t *testing.T, dir, name string, encoder func(*os.File, image.Image)) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 10; x++ {
+			img.Set(x, y, color.RGBA{R: 255, G: 0, B: 0, A: 255})
+		}
+	}
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder(f, img)
+	f.Close()
+	return path
+}
+
+func TestNormalizeImage_JPEG(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := createTestImage(t, dir, "test.jpg", func(f *os.File, img image.Image) {
+		jpeg.Encode(f, img, nil)
+	})
+
+	h := &Handler{}
+	result, cleanup, err := h.normalizeImage(imgPath, ".jpg")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cleanup != nil {
+		t.Error("expected nil cleanup for JPEG passthrough")
+	}
+	if result != imgPath {
+		t.Errorf("expected same path %q, got %q", imgPath, result)
+	}
+}
+
+func TestNormalizeImage_PNG(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := createTestImage(t, dir, "test.png", func(f *os.File, img image.Image) {
+		png.Encode(f, img)
+	})
+
+	h := &Handler{}
+	result, cleanup, err := h.normalizeImage(imgPath, ".png")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cleanup != nil {
+		t.Error("expected nil cleanup for PNG passthrough")
+	}
+	if result != imgPath {
+		t.Errorf("expected same path %q, got %q", imgPath, result)
+	}
+}
+
+func TestNormalizeImage_GIF(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := createTestImage(t, dir, "test.gif", func(f *os.File, img image.Image) {
+		gif.Encode(f, img, nil)
+	})
+
+	h := &Handler{}
+	result, cleanup, err := h.normalizeImage(imgPath, ".gif")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cleanup == nil {
+		t.Error("expected non-nil cleanup for GIF conversion")
+	}
+	defer cleanup()
+
+	if result == imgPath {
+		t.Error("expected different output path for GIF conversion")
+	}
+	if filepath.Ext(result) != ".jpg" {
+		t.Errorf("expected .jpg extension, got %q", filepath.Ext(result))
+	}
+
+	// Verify the output is valid JPEG
+	f, err := os.Open(result)
+	if err != nil {
+		t.Fatalf("open result: %v", err)
+	}
+	defer f.Close()
+	_, err = jpeg.Decode(f)
+	if err != nil {
+		t.Fatalf("result is not valid JPEG: %v", err)
+	}
+}
+
+func TestNormalizeImage_HEIC(t *testing.T) {
+	dir := t.TempDir()
+	// Create a dummy HEIC file (not a real HEIC, so conversion will fail)
+	heicPath := filepath.Join(dir, "test.heic")
+	os.WriteFile(heicPath, []byte("not-a-real-heic"), 0644)
+
+	// Use a fake converter that always fails
+	h := &Handler{heifConvertPath: "/nonexistent/heif-convert"}
+	_, _, err := h.normalizeImage(heicPath, ".heic")
+	if err == nil {
+		t.Fatal("expected error when heif-convert is not available")
+	}
+	if !strings.Contains(err.Error(), "heif-convert") {
+		t.Errorf("expected heif-convert error, got: %v", err)
+	}
+}
+
+func TestNormalizeImage_HEIC_WithConverter(t *testing.T) {
+	// Create a shell script that acts as heif-convert: copies a valid JPEG to output
+	dir := t.TempDir()
+
+	// Create a real JPEG to use as "converted" output
+	jpegPath := createTestImage(t, dir, "source.jpg", func(f *os.File, img image.Image) {
+		jpeg.Encode(f, img, nil)
+	})
+
+	// Create a fake heif-convert script that copies the JPEG
+	scriptPath := filepath.Join(dir, "fake-heif-convert")
+	os.WriteFile(scriptPath, []byte(fmt.Sprintf("#!/bin/sh\ncp %s \"$2\"\n", jpegPath)), 0755)
+
+	heicPath := filepath.Join(dir, "test.heic")
+	os.WriteFile(heicPath, []byte("fake-heic-data"), 0644)
+
+	h := &Handler{heifConvertPath: scriptPath}
+	result, cleanup, err := h.normalizeImage(heicPath, ".heic")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cleanup == nil {
+		t.Error("expected non-nil cleanup for HEIC conversion")
+	}
+	defer cleanup()
+
+	if filepath.Ext(result) != ".jpg" {
+		t.Errorf("expected .jpg extension, got %q", filepath.Ext(result))
+	}
+
+	// Verify the output is valid JPEG
+	f, err := os.Open(result)
+	if err != nil {
+		t.Fatalf("open result: %v", err)
+	}
+	defer f.Close()
+	_, err = jpeg.Decode(f)
+	if err != nil {
+		t.Fatalf("result is not valid JPEG: %v", err)
+	}
+}
+
+func TestGetHeifConvertPath(t *testing.T) {
+	h := &Handler{}
+
+	// Default should return "heif-convert" (falls through to PATH)
+	path := h.getHeifConvertPath()
+	if path != "heif-convert" {
+		t.Errorf("expected 'heif-convert', got %q", path)
+	}
+
+	// Custom path should be used
+	h.heifConvertPath = "/custom/path/heif-convert"
+	path = h.getHeifConvertPath()
+	if path != "/custom/path/heif-convert" {
+		t.Errorf("expected custom path, got %q", path)
+	}
+}
+
+func TestHandleSingleImage_GIF(t *testing.T) {
+	sqsMock := &mockSQS{}
+	db := &mockDB{
+		execFn: func(ctx context.Context, sql string, args ...any) error {
+			return nil
+		},
+		insertFn: func(ctx context.Context, sql string, args ...any) (string, error) {
+			return "page-id-1", nil
+		},
+	}
+
+	// Create a real GIF file and serve it from mock S3
+	tmpDir := t.TempDir()
+	gifImg := image.NewRGBA(image.Rect(0, 0, 10, 10))
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 10; x++ {
+			gifImg.Set(x, y, color.RGBA{R: 0, G: 255, B: 0, A: 255})
+		}
+	}
+	var gifBuf strings.Builder
+	gif.Encode(&gifBuf, gifImg, nil)
+	gifData := gifBuf.String()
+
+	_ = tmpDir
+
+	// Mock S3 that returns GIF data
+	gifS3 := &mockS3WithData{data: gifData}
+
+	h := &Handler{
+		db:       db,
+		s3:       gifS3,
+		sqs:      sqsMock,
+		bucket:   "test-bucket",
+		queueURL: "https://sqs.example.com/queue",
+	}
+
+	err := h.handlePDFUpload(context.Background(), "batch-1", "photo.gif", "uploads/batch-1/photo.gif", "test-bucket")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(gifS3.putCalls) != 1 {
+		t.Errorf("expected 1 S3 put call, got %d", len(gifS3.putCalls))
+	}
+	if len(sqsMock.messages) != 1 {
+		t.Errorf("expected 1 SQS message, got %d", len(sqsMock.messages))
+	}
+}
+
+// mockS3WithData returns specific data from GetObject.
+type mockS3WithData struct {
+	data     string
+	putCalls []string
+}
+
+func (m *mockS3WithData) PresignPutObject(ctx context.Context, bucket, key, contentType string, expires time.Duration) (string, error) {
+	return "", nil
+}
+func (m *mockS3WithData) PresignGetObject(ctx context.Context, bucket, key string, expires time.Duration) (string, error) {
+	return "", nil
+}
+func (m *mockS3WithData) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(m.data)), nil
+}
+func (m *mockS3WithData) PutObject(ctx context.Context, bucket, key, contentType string, body io.Reader) error {
+	m.putCalls = append(m.putCalls, key)
+	return nil
 }

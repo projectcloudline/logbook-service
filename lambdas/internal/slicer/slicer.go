@@ -5,8 +5,17 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
+	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 )
 
 // Options controls the slicing algorithm.
@@ -41,10 +50,23 @@ func DefaultOptions() Options {
 // SliceImage decodes an image and splits it into horizontal strips at blank
 // gaps between entries. If fewer than 2 regions are detected, the full image
 // is returned as a single slice.
+//
+// Supports JPEG, PNG, GIF, BMP, TIFF, and WebP natively. For HEIC/HEIF and
+// other formats not decodable by Go, it attempts conversion to JPEG via
+// external tools (sips on macOS, magick/convert on Linux).
 func SliceImage(imageBytes []byte, opts Options) ([]Slice, error) {
 	img, _, err := image.Decode(bytes.NewReader(imageBytes))
 	if err != nil {
-		return nil, fmt.Errorf("decode image: %w", err)
+		// Native decode failed — try converting via external tool.
+		converted, convErr := convertToJPEG(imageBytes)
+		if convErr != nil {
+			return nil, fmt.Errorf("decode image: %w (conversion also failed: %v)", err, convErr)
+		}
+		img, _, err = image.Decode(bytes.NewReader(converted))
+		if err != nil {
+			return nil, fmt.Errorf("decode converted image: %w", err)
+		}
+		log.Printf("slicer: converted non-native image format to JPEG (%d → %d bytes)", len(imageBytes), len(converted))
 	}
 
 	bounds := img.Bounds()
@@ -104,6 +126,73 @@ func SliceImage(imageBytes []byte, opts Options) ([]Slice, error) {
 	}
 
 	return slices, nil
+}
+
+// convertToJPEG attempts to convert image bytes to JPEG using external tools.
+// Tries sips (macOS) first, then magick (ImageMagick 7), then convert (ImageMagick 6).
+func convertToJPEG(imageBytes []byte) ([]byte, error) {
+	converters := []struct {
+		name string
+		args func(inPath, outPath string) []string
+	}{
+		{"sips", func(in, out string) []string {
+			return []string{"-s", "format", "jpeg", in, "--out", out}
+		}},
+		{"magick", func(in, out string) []string {
+			return []string{in, out}
+		}},
+		{"convert", func(in, out string) []string {
+			return []string{in, out}
+		}},
+	}
+
+	for _, conv := range converters {
+		path, err := exec.LookPath(conv.name)
+		if err != nil {
+			continue
+		}
+
+		result, err := runConverter(path, conv.args, imageBytes)
+		if err != nil {
+			log.Printf("slicer: %s conversion failed: %v", conv.name, err)
+			continue
+		}
+		return result, nil
+	}
+
+	return nil, fmt.Errorf("no image converter available (tried sips, magick, convert)")
+}
+
+// runConverter writes input to a temp file, runs the converter, reads the output.
+func runConverter(bin string, argsFn func(string, string) []string, imageBytes []byte) ([]byte, error) {
+	inFile, err := os.CreateTemp("", "slicer-in-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp input: %w", err)
+	}
+	defer os.Remove(inFile.Name())
+
+	if _, err := inFile.Write(imageBytes); err != nil {
+		inFile.Close()
+		return nil, fmt.Errorf("write temp input: %w", err)
+	}
+	inFile.Close()
+
+	outPath := inFile.Name() + ".jpg"
+	defer os.Remove(outPath)
+
+	args := argsFn(inFile.Name(), outPath)
+	cmd := exec.Command(bin, args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("%s: %w (%s)", bin, err, string(output))
+	}
+
+	outFile, err := os.Open(outPath)
+	if err != nil {
+		return nil, fmt.Errorf("open converted output: %w", err)
+	}
+	defer outFile.Close()
+
+	return io.ReadAll(outFile)
 }
 
 // projectionProfile counts dark pixels per row.
@@ -210,4 +299,3 @@ func encodeJPEG(img image.Image, rect image.Rectangle, quality int) ([]byte, err
 	}
 	return buf.Bytes(), nil
 }
-

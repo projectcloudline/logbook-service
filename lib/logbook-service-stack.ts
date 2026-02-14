@@ -112,6 +112,7 @@ export class LogbookServiceStack extends cdk.Stack {
           beforeBundling: (_inputDir: string, _outputDir: string) => [],
           afterBundling: (inputDir: string, outputDir: string) => [
             `cp ${inputDir}/bin/mutool-arm64 ${outputDir}/bin/mutool-arm64 2>/dev/null || true`,
+            `cp ${inputDir}/bin/heif-convert-arm64 ${outputDir}/bin/heif-convert-arm64 2>/dev/null || true`,
           ],
         },
       },
