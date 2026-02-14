@@ -36,12 +36,13 @@ type Slice struct {
 }
 
 // DefaultOptions returns sensible defaults for logbook page slicing.
+// Tuned for iPhone photos of logbook pages (~4032x3024).
 func DefaultOptions() Options {
 	return Options{
 		DarknessThreshold: 128,
-		DilationRadius:    15,
+		DilationRadius:    80,
 		MinGapHeight:      10,
-		MinSliceHeight:    40,
+		MinSliceHeight:    150,
 		Padding:           15,
 		JPEGQuality:       85,
 	}
@@ -76,11 +77,42 @@ func SliceImage(imageBytes []byte, opts Options) ([]Slice, error) {
 	// Step 1: Compute vertical projection profile — count dark pixels per row.
 	profile := projectionProfile(img, bounds, opts.DarknessThreshold)
 
-	// Step 2: Dilate profile to merge nearby text lines.
-	dilated := dilateProfile(profile, opts.DilationRadius)
+	// Step 2: Subtract noise floor. Real-world photos of logbooks always have
+	// dark pixels from table grid lines, binding shadows, and sensor noise.
+	// We use 7% of image width as the floor: this zeroes out both pure
+	// background noise (2-4% of width) and empty table rows with vertical
+	// grid lines (5-7% of width). Only actual text content (8%+) survives.
+	noiseFloor := width * 7 / 100
+	for i, v := range profile {
+		if v > noiseFloor {
+			profile[i] = v - noiseFloor
+		} else {
+			profile[i] = 0
+		}
+	}
 
-	// Step 3: Find gap regions (contiguous runs of zero in dilated profile).
-	regions := findRegions(dilated, height, opts.MinGapHeight)
+	// Step 3: Smooth profile with a moving average. Unlike max-dilation,
+	// a moving average naturally distinguishes narrow within-entry gaps
+	// (which stay non-zero because surrounding content contributes to the
+	// average) from wide between-entry gaps (which average to zero because
+	// all rows in the window are empty).
+	smoothed := smoothProfile(profile, opts.DilationRadius)
+
+	// Step 4: Apply content threshold. After the aggressive noise floor and
+	// smoothing, remaining non-zero values represent genuine text content.
+	// A low threshold catches weak content (like aircraft info headers) that
+	// the smoothing reduces in amplitude.
+	contentThreshold := width / 100 // ~1% of width
+
+	// Step 5: Find gap regions (contiguous runs below threshold in smoothed profile).
+	regions := findRegions(smoothed, height, opts.MinGapHeight, contentThreshold)
+
+	// Step 6: Absorb small regions into neighbors. Logbook entries have an
+	// aircraft info header above the entry text, sometimes separated by a gap
+	// wider than the gap between consecutive entries. This merges orphaned
+	// aircraft info sections and tiny fragments back into the nearest entry.
+	minEntryHeight := height / 8
+	regions = absorbSmallRegions(regions, minEntryHeight)
 
 	// If fewer than 2 regions, return the full image as one slice.
 	if len(regions) < 2 {
@@ -91,7 +123,7 @@ func SliceImage(imageBytes []byte, opts Options) ([]Slice, error) {
 		return []Slice{{Index: 0, ImageData: data, Y0: 0, Y1: height}}, nil
 	}
 
-	// Step 4: Crop each region with padding and encode as JPEG.
+	// Step 7: Crop each region with padding and encode as JPEG.
 	var slices []Slice
 	idx := 0
 	for _, r := range regions {
@@ -216,6 +248,37 @@ func projectionProfile(img image.Image, bounds image.Rectangle, threshold uint8)
 	return profile
 }
 
+// smoothProfile applies a moving average with the given radius.
+// Each output value is the mean of input values in [i-radius, i+radius].
+// This bridges narrow gaps surrounded by content while preserving wide gaps.
+func smoothProfile(profile []int, radius int) []int {
+	n := len(profile)
+	if n == 0 {
+		return profile
+	}
+
+	// Build prefix sum for O(n) moving average
+	prefix := make([]int, n+1)
+	for i, v := range profile {
+		prefix[i+1] = prefix[i] + v
+	}
+
+	smoothed := make([]int, n)
+	for i := range n {
+		lo := i - radius
+		hi := i + radius
+		if lo < 0 {
+			lo = 0
+		}
+		if hi >= n {
+			hi = n - 1
+		}
+		width := hi - lo + 1
+		smoothed[i] = (prefix[hi+1] - prefix[lo]) / width
+	}
+	return smoothed
+}
+
 // dilateProfile applies a sliding-window max to spread non-zero values.
 func dilateProfile(profile []int, radius int) []int {
 	n := len(profile)
@@ -240,16 +303,17 @@ func dilateProfile(profile []int, radius int) []int {
 	return dilated
 }
 
-// findRegions identifies contiguous non-zero runs in the dilated profile.
+// findRegions identifies contiguous content runs in the profile.
+// A row is considered content if its value exceeds contentThreshold.
 // Returns a list of [y0, y1) pairs. Gaps shorter than minGapHeight between
-// non-zero regions are merged (the regions on either side are combined).
-func findRegions(dilated []int, height, minGapHeight int) [][2]int {
+// content regions are merged (the regions on either side are combined).
+func findRegions(dilated []int, height, minGapHeight, contentThreshold int) [][2]int {
 	var regions [][2]int
 	inRegion := false
 	start := 0
 
 	for y := 0; y < height; y++ {
-		if dilated[y] > 0 {
+		if dilated[y] > contentThreshold {
 			if !inRegion {
 				inRegion = true
 				start = y
@@ -268,6 +332,55 @@ func findRegions(dilated []int, height, minGapHeight int) [][2]int {
 	// Merge regions separated by gaps smaller than minGapHeight.
 	merged := mergeRegions(regions, minGapHeight)
 	return merged
+}
+
+// absorbSmallRegions iteratively merges regions that are too small to be a
+// standalone logbook entry into their nearest neighbor (smallest gap).
+// This handles orphaned aircraft info headers and small fragments that are
+// visually part of an adjacent entry but separated by a gap.
+func absorbSmallRegions(regions [][2]int, minHeight int) [][2]int {
+	for {
+		// Find smallest region below threshold.
+		smallIdx := -1
+		smallHeight := 0
+		for i, r := range regions {
+			h := r[1] - r[0]
+			if h < minHeight && (smallIdx == -1 || h < smallHeight) {
+				smallIdx = i
+				smallHeight = h
+			}
+		}
+		if smallIdx == -1 {
+			break // All regions are large enough.
+		}
+		if len(regions) < 2 {
+			break // Nothing to merge with.
+		}
+
+		// Find adjacent region with smallest gap.
+		mergeWith := -1
+		bestGap := 0
+		if smallIdx > 0 {
+			gap := regions[smallIdx][0] - regions[smallIdx-1][1]
+			mergeWith = smallIdx - 1
+			bestGap = gap
+		}
+		if smallIdx < len(regions)-1 {
+			gap := regions[smallIdx+1][0] - regions[smallIdx][1]
+			if mergeWith == -1 || gap < bestGap {
+				mergeWith = smallIdx + 1
+			}
+		}
+
+		// Merge: expand the neighbor to cover both regions.
+		lo, hi := smallIdx, mergeWith
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		merged := [2]int{regions[lo][0], regions[hi][1]}
+		regions = append(regions[:lo], append([][2]int{merged}, regions[hi+1:]...)...)
+	}
+	return regions
 }
 
 // mergeRegions combines adjacent regions whose gap is smaller than minGap.

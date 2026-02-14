@@ -29,6 +29,20 @@ func encodeTestJPEG(img image.Image) []byte {
 	return buf.Bytes()
 }
 
+// smallImageOptions returns options scaled for small synthetic test images.
+// DefaultOptions is tuned for ~4032x3024 iPhone photos; these values are
+// proportionally reduced so the algorithm behaves correctly on tiny images.
+func smallImageOptions() Options {
+	return Options{
+		DarknessThreshold: 128,
+		DilationRadius:    5,
+		MinGapHeight:      5,
+		MinSliceHeight:    20,
+		Padding:           5,
+		JPEGQuality:       85,
+	}
+}
+
 func TestProjectionProfile(t *testing.T) {
 	// 100x100 image with a dark band from rows 20-40.
 	img := newTestImage(100, 100, [][2]int{{20, 40}})
@@ -109,7 +123,7 @@ func TestFindRegions(t *testing.T) {
 		dilated[i] = 1
 	}
 
-	regions := findRegions(dilated, 200, 10)
+	regions := findRegions(dilated, 200, 10, 0)
 	if len(regions) != 2 {
 		t.Fatalf("got %d regions, want 2", len(regions))
 	}
@@ -131,7 +145,7 @@ func TestFindRegions_MergesSmallGaps(t *testing.T) {
 		dilated[i] = 1
 	}
 
-	regions := findRegions(dilated, 100, 10)
+	regions := findRegions(dilated, 100, 10, 0)
 	if len(regions) != 1 {
 		t.Fatalf("got %d regions, want 1 (should be merged)", len(regions))
 	}
@@ -149,7 +163,7 @@ func TestSliceImage_ThreeBands(t *testing.T) {
 	})
 	jpegData := encodeTestJPEG(img)
 
-	slices, err := SliceImage(jpegData, DefaultOptions())
+	slices, err := SliceImage(jpegData, smallImageOptions())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -246,7 +260,7 @@ func TestSliceImage_PNGInput(t *testing.T) {
 
 	// Encode as JPEG since we need a simple test (PNG import is registered).
 	jpegData := encodeTestJPEG(img)
-	slices, err := SliceImage(jpegData, DefaultOptions())
+	slices, err := SliceImage(jpegData, smallImageOptions())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -325,6 +339,64 @@ func TestMergeRegions(t *testing.T) {
 	}
 }
 
+func TestAbsorbSmallRegions(t *testing.T) {
+	tests := []struct {
+		name      string
+		regions   [][2]int
+		minHeight int
+		want      [][2]int
+	}{
+		{
+			name:      "no regions",
+			regions:   nil,
+			minHeight: 100,
+			want:      nil,
+		},
+		{
+			name:      "all large",
+			regions:   [][2]int{{0, 500}, {600, 1200}, {1400, 2000}},
+			minHeight: 100,
+			want:      [][2]int{{0, 500}, {600, 1200}, {1400, 2000}},
+		},
+		{
+			name:      "small region merges with nearest neighbor",
+			regions:   [][2]int{{0, 999}, {1084, 1131}, {1213, 1447}, {1523, 2309}, {2354, 3024}},
+			minHeight: 378,
+			// Region 1 (47 rows) → merges with nearest (region 2, gap=82)
+			// Combined 1+2 (363 rows) < 378 → merges with nearest (region 3, gap=76)
+			want: [][2]int{{0, 999}, {1084, 2309}, {2354, 3024}},
+		},
+		{
+			name:      "single small region with one neighbor",
+			regions:   [][2]int{{0, 500}, {600, 650}},
+			minHeight: 100,
+			want:      [][2]int{{0, 650}},
+		},
+		{
+			name:      "small region between two large — merges with closer",
+			regions:   [][2]int{{0, 500}, {520, 560}, {700, 1200}},
+			minHeight: 100,
+			// Gap to left = 520-500 = 20, gap to right = 700-560 = 140
+			// Merges with left (smaller gap)
+			want: [][2]int{{0, 560}, {700, 1200}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := absorbSmallRegions(tt.regions, tt.minHeight)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d regions, want %d: %v", len(got), len(tt.want), got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("region %d = %v, want %v", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestSliceImage_GrayscaleDetection(t *testing.T) {
 	// Test with gray pixels near the threshold boundary.
 	img := newTestImage(100, 200, nil)
@@ -343,7 +415,7 @@ func TestSliceImage_GrayscaleDetection(t *testing.T) {
 	}
 
 	jpegData := encodeTestJPEG(img)
-	slices, err := SliceImage(jpegData, DefaultOptions())
+	slices, err := SliceImage(jpegData, smallImageOptions())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
