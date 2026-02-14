@@ -3,7 +3,6 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
-import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
@@ -13,6 +12,7 @@ import * as eventsTargets from 'aws-cdk-lib/aws-events-targets';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
+import * as lambdago from '@aws-cdk/aws-lambda-go-alpha';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -81,27 +81,12 @@ export class LogbookServiceStack extends cdk.Stack {
       ANALYZE_QUEUE_URL: analyzeQueue.queueUrl,
     };
 
-    // ─── API Lambda ────────────────────────────────────────────
-    const apiFunction = new lambda.Function(this, 'ApiFunction', {
+    // ─── API Lambda (Go) ────────────────────────────────────────
+    const apiFunction = new lambdago.GoFunction(this, 'ApiFunction', {
       functionName: 'logbook-api',
-      runtime: lambda.Runtime.PYTHON_3_12,
+      entry: path.join(__dirname, '..', 'lambdas', 'api'),
+      runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
-      handler: 'handler.handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'api'), {
-        bundling: {
-          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
-          command: [
-            'bash', '-c',
-            'pip install -r requirements.txt -t /asset-output && ' +
-            'cp -r . /asset-output/ && ' +
-            'cp -r /asset-input/shared /asset-output/shared'
-          ],
-          volumes: [{
-            hostPath: path.join(__dirname, '..', 'lambda', 'shared'),
-            containerPath: '/asset-input/shared',
-          }],
-        },
-      }),
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: {
@@ -112,55 +97,33 @@ export class LogbookServiceStack extends cdk.Stack {
       ...lambdaVpcConfig,
     });
 
-    // ─── Split Lambda ──────────────────────────────────────────
-    const splitFunction = new lambda.Function(this, 'SplitFunction', {
+    // ─── Split Lambda (Go) ──────────────────────────────────────
+    const splitFunction = new lambdago.GoFunction(this, 'SplitFunction', {
       functionName: 'logbook-split',
-      runtime: lambda.Runtime.PYTHON_3_12,
+      entry: path.join(__dirname, '..', 'lambdas', 'split'),
+      runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
-      handler: 'handler.handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'split'), {
-        bundling: {
-          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
-          command: [
-            'bash', '-c',
-            'pip install -r requirements.txt -t /asset-output && ' +
-            'cp -r . /asset-output/ && ' +
-            'cp -r /asset-input/shared /asset-output/shared'
-          ],
-          volumes: [{
-            hostPath: path.join(__dirname, '..', 'lambda', 'shared'),
-            containerPath: '/asset-input/shared',
-          }],
-        },
-      }),
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
       ephemeralStorageSize: cdk.Size.mebibytes(1024),
       environment: sharedEnv,
+      bundling: {
+        commandHooks: {
+          beforeBundling: (_inputDir: string, _outputDir: string) => [],
+          afterBundling: (inputDir: string, outputDir: string) => [
+            `cp ${inputDir}/bin/mutool-arm64 ${outputDir}/bin/mutool-arm64 2>/dev/null || true`,
+          ],
+        },
+      },
       ...lambdaVpcConfig,
     });
 
-    // ─── Analyze Lambda ────────────────────────────────────────
-    const analyzeFunction = new lambda.Function(this, 'AnalyzeFunction', {
+    // ─── Analyze Lambda (Go) ────────────────────────────────────
+    const analyzeFunction = new lambdago.GoFunction(this, 'AnalyzeFunction', {
       functionName: 'logbook-analyze',
-      runtime: lambda.Runtime.PYTHON_3_12,
+      entry: path.join(__dirname, '..', 'lambdas', 'analyze'),
+      runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
-      handler: 'handler.handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'analyze'), {
-        bundling: {
-          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
-          command: [
-            'bash', '-c',
-            'pip install -r requirements.txt -t /asset-output && ' +
-            'cp -r . /asset-output/ && ' +
-            'cp -r /asset-input/shared /asset-output/shared'
-          ],
-          volumes: [{
-            hostPath: path.join(__dirname, '..', 'lambda', 'shared'),
-            containerPath: '/asset-input/shared',
-          }],
-        },
-      }),
       timeout: cdk.Duration.minutes(5),
       memorySize: 512,
       environment: sharedEnv,
@@ -171,7 +134,7 @@ export class LogbookServiceStack extends cdk.Stack {
     // ─── Permissions ───────────────────────────────────────────
     bucket.grantReadWrite(apiFunction);
     bucket.grantReadWrite(splitFunction);
-    bucket.grantRead(analyzeFunction);
+    bucket.grantReadWrite(analyzeFunction);
 
     dbSecret.grantRead(apiFunction);
     dbSecret.grantRead(splitFunction);
