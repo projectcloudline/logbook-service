@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/projectcloudline/logbook-service/internal/anthropic"
 	"github.com/projectcloudline/logbook-service/internal/gemini"
 	"github.com/projectcloudline/logbook-service/internal/slicer"
 )
@@ -70,7 +71,6 @@ func (h *Handler) processPage(ctx context.Context, msg pageMessage) error {
 	var allEntries []extractedEntry
 	var lastPageType string
 
-	temp := float32(0.1)
 	for _, sl := range slices {
 		// Upload slice to S3 for debugging/audit (non-fatal)
 		sliceKey := fmt.Sprintf("slices/%s/page_%04d/slice_%03d.jpg", batchID, msg.PageNumber, sl.Index)
@@ -83,38 +83,19 @@ func (h *Handler) processPage(ctx context.Context, msg pageMessage) error {
 		sliceMIME := "image/jpeg"
 		sliceData := sl.ImageData
 		if sliceErr != nil {
-			// Fallback: use original image bytes and MIME type
 			sliceMIME = mimeType
 			sliceData = imageBytes
 		}
 
-		responseText, geminiErr := geminiClient.GenerateContent(ctx, "gemini-2.5-flash", []gemini.Part{
-			{Text: SliceExtractionPrompt},
-			{Data: sliceData, MIMEType: sliceMIME},
-		}, &gemini.GenerateConfig{
-			Temperature:      &temp,
-			ResponseMIMEType: "application/json",
-		})
-		if geminiErr != nil {
-			log.Printf("WARNING: gemini failed for slice %d of page %s: %v", sl.Index, msg.PageID, geminiErr)
+		entries, pageType, extractErr := h.extractAndVerifySlice(ctx, sliceData, sliceMIME, geminiClient, sl.Index, msg.PageID)
+		if extractErr != nil {
+			log.Printf("WARNING: extract+verify failed for slice %d of page %s: %v", sl.Index, msg.PageID, extractErr)
 			continue
 		}
 
-		responseText = cleanMarkdownFences(responseText)
-		if responseText == "" {
-			log.Printf("WARNING: empty Gemini response for slice %d of page %s", sl.Index, msg.PageID)
-			continue
-		}
-
-		var sliceExtraction extractionResult
-		if err := json.Unmarshal([]byte(responseText), &sliceExtraction); err != nil {
-			log.Printf("WARNING: parse failed for slice %d of page %s: %v", sl.Index, msg.PageID, err)
-			continue
-		}
-
-		allEntries = append(allEntries, sliceExtraction.Entries...)
-		if sliceExtraction.PageType != "" {
-			lastPageType = sliceExtraction.PageType
+		allEntries = append(allEntries, entries...)
+		if pageType != "" {
+			lastPageType = pageType
 		}
 	}
 
@@ -255,6 +236,303 @@ func (h *Handler) getGeminiClient(ctx context.Context) (gemini.Client, error) {
 		return nil, err
 	}
 	h.gemini = client
+	return client, nil
+}
+
+// ─── QA Verification ────────────────────────────────────────────────────────
+
+type qaVerdict string
+
+const (
+	qaPass        qaVerdict = "pass"
+	qaFail        qaVerdict = "fail"
+	qaNeedsReview qaVerdict = "needs_review"
+)
+
+type qaFieldIssue struct {
+	Field     string `json:"field"`
+	Issue     string `json:"issue"`
+	Expected  string `json:"expected"`
+	Extracted string `json:"extracted"`
+	Severity  string `json:"severity"`
+}
+
+type qaResult struct {
+	EntryIndex int            `json:"entryIndex"`
+	Verdict    qaVerdict      `json:"verdict"`
+	Issues     []qaFieldIssue `json:"issues"`
+	Summary    string         `json:"summary"`
+}
+
+type qaReport struct {
+	Results []qaResult `json:"results"`
+}
+
+// extractAndVerifySlice performs extraction with QA verification. Up to 2
+// extraction attempts. Returns entries with NeedsReview flags set as needed.
+func (h *Handler) extractAndVerifySlice(ctx context.Context, imageData []byte, mimeType string, geminiClient gemini.Client, sliceIndex int, pageID string) ([]extractedEntry, string, error) {
+	const maxAttempts = 2
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Extract
+		prompt := SliceExtractionPrompt
+		var lastIssues []qaFieldIssue
+		if attempt > 1 {
+			prompt = buildRetryPrompt(lastIssues)
+		}
+
+		entries, pageType, err := h.extractSlice(ctx, geminiClient, imageData, mimeType, prompt, sliceIndex, pageID, attempt)
+		if err != nil {
+			return nil, "", err
+		}
+
+		// Skip QA for empty extractions
+		if len(entries) == 0 {
+			return entries, pageType, nil
+		}
+
+		// Run QA
+		report, qaErr := h.verifyExtraction(ctx, imageData, mimeType, entries, geminiClient)
+		if qaErr != nil {
+			// QA failure is non-fatal — flag for review and return
+			log.Printf("WARNING: QA verification failed for slice %d of page %s: %v", sliceIndex, pageID, qaErr)
+			for i := range entries {
+				entries[i].NeedsReview = true
+				entries[i].ExtractionNotes += "QA verification error: " + qaErr.Error() + ". "
+			}
+			return entries, pageType, nil
+		}
+
+		// Evaluate QA results
+		allPassed := true
+		hasCriticalFail := false
+		var criticalIssues []qaFieldIssue
+
+		for _, r := range report.Results {
+			switch r.Verdict {
+			case qaPass:
+				// Entry is good
+			case qaNeedsReview:
+				if r.EntryIndex >= 0 && r.EntryIndex < len(entries) {
+					entries[r.EntryIndex].NeedsReview = true
+					entries[r.EntryIndex].ExtractionNotes += "QA: " + r.Summary + ". "
+				}
+			case qaFail:
+				allPassed = false
+				hasCriticalFail = true
+				for _, issue := range r.Issues {
+					if issue.Severity == "critical" {
+						criticalIssues = append(criticalIssues, issue)
+					}
+				}
+				if r.EntryIndex >= 0 && r.EntryIndex < len(entries) {
+					entries[r.EntryIndex].ExtractionNotes += "QA fail: " + r.Summary + ". "
+				}
+			}
+		}
+
+		if allPassed {
+			log.Printf("  Slice %d of page %s: QA passed (attempt %d)", sliceIndex, pageID, attempt)
+			return entries, pageType, nil
+		}
+
+		if !hasCriticalFail {
+			// Only minor issues — accept with review flags
+			return entries, pageType, nil
+		}
+
+		// Critical failure — retry if we have attempts left
+		if attempt < maxAttempts {
+			log.Printf("  Slice %d of page %s: QA failed with %d critical issues, retrying (attempt %d)", sliceIndex, pageID, len(criticalIssues), attempt)
+			lastIssues = criticalIssues
+			// Build retry prompt with the issues we found
+			prompt = buildRetryPrompt(lastIssues)
+
+			retryEntries, retryPageType, retryErr := h.extractSlice(ctx, geminiClient, imageData, mimeType, prompt, sliceIndex, pageID, attempt+1)
+			if retryErr != nil {
+				// Retry extraction failed — flag originals for review
+				for i := range entries {
+					entries[i].NeedsReview = true
+				}
+				return entries, pageType, nil
+			}
+
+			if len(retryEntries) == 0 {
+				return retryEntries, retryPageType, nil
+			}
+
+			// QA the retry
+			retryReport, retryQAErr := h.verifyExtraction(ctx, imageData, mimeType, retryEntries, geminiClient)
+			if retryQAErr != nil {
+				for i := range retryEntries {
+					retryEntries[i].NeedsReview = true
+					retryEntries[i].ExtractionNotes += "QA verification error on retry: " + retryQAErr.Error() + ". "
+				}
+				return retryEntries, retryPageType, nil
+			}
+
+			// Evaluate retry QA
+			retryAllPassed := true
+			for _, r := range retryReport.Results {
+				if r.Verdict == qaFail {
+					retryAllPassed = false
+					if r.EntryIndex >= 0 && r.EntryIndex < len(retryEntries) {
+						retryEntries[r.EntryIndex].NeedsReview = true
+						retryEntries[r.EntryIndex].ExtractionNotes += "QA fail after retry: " + r.Summary + ". "
+					}
+				} else if r.Verdict == qaNeedsReview {
+					if r.EntryIndex >= 0 && r.EntryIndex < len(retryEntries) {
+						retryEntries[r.EntryIndex].NeedsReview = true
+						retryEntries[r.EntryIndex].ExtractionNotes += "QA: " + r.Summary + ". "
+					}
+				}
+			}
+
+			if retryAllPassed {
+				log.Printf("  Slice %d of page %s: QA passed after retry", sliceIndex, pageID)
+			} else {
+				log.Printf("  Slice %d of page %s: QA still failing after retry, flagging for review", sliceIndex, pageID)
+				for i := range retryEntries {
+					retryEntries[i].NeedsReview = true
+				}
+			}
+			return retryEntries, retryPageType, nil
+		}
+
+		// Max attempts reached — flag for review and return
+		log.Printf("  Slice %d of page %s: QA failed after %d attempts, flagging for review", sliceIndex, pageID, maxAttempts)
+		for i := range entries {
+			entries[i].NeedsReview = true
+		}
+		return entries, pageType, nil
+	}
+
+	// Should not be reached
+	return nil, "", nil
+}
+
+// extractSlice calls Gemini to extract entries from a single slice image.
+func (h *Handler) extractSlice(ctx context.Context, geminiClient gemini.Client, imageData []byte, mimeType, prompt string, sliceIndex int, pageID string, attempt int) ([]extractedEntry, string, error) {
+	temp := float32(0.1)
+	responseText, err := geminiClient.GenerateContent(ctx, "gemini-2.5-flash", []gemini.Part{
+		{Text: prompt},
+		{Data: imageData, MIMEType: mimeType},
+	}, &gemini.GenerateConfig{
+		Temperature:      &temp,
+		ResponseMIMEType: "application/json",
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("gemini extraction (attempt %d): %w", attempt, err)
+	}
+
+	responseText = cleanMarkdownFences(responseText)
+	if responseText == "" {
+		log.Printf("WARNING: empty Gemini response for slice %d of page %s (attempt %d)", sliceIndex, pageID, attempt)
+		return nil, "", nil
+	}
+
+	var result extractionResult
+	if err := json.Unmarshal([]byte(responseText), &result); err != nil {
+		return nil, "", fmt.Errorf("parse extraction (attempt %d): %w", attempt, err)
+	}
+
+	return result.Entries, result.PageType, nil
+}
+
+// verifyExtraction sends the slice image and extraction JSON to the QA model.
+// Uses Claude if available, falls back to Gemini.
+func (h *Handler) verifyExtraction(ctx context.Context, imageData []byte, mimeType string, entries []extractedEntry, geminiClient gemini.Client) (*qaReport, error) {
+	extractionJSON, err := json.Marshal(entries)
+	if err != nil {
+		return nil, fmt.Errorf("marshal extraction for QA: %w", err)
+	}
+
+	qaPrompt := QAVerificationPrompt + "\n\nExtraction to verify:\n" + string(extractionJSON)
+
+	var responseText string
+
+	// Try Claude first, fall back to Gemini
+	claudeClient, claudeErr := h.getClaudeClient(ctx)
+	if claudeErr == nil && claudeClient != nil {
+		responseText, err = claudeClient.CreateMessage(ctx, "claude-haiku-4-5-20251001", 4096, []anthropic.Message{
+			{
+				Role: "user",
+				Content: []anthropic.ContentPart{
+					{ImageData: imageData, MIMEType: mimeType},
+					{Text: qaPrompt},
+				},
+			},
+		})
+		if err != nil {
+			log.Printf("WARNING: Claude QA failed, falling back to Gemini: %v", err)
+			responseText, err = h.geminiQA(ctx, geminiClient, imageData, mimeType, qaPrompt)
+			if err != nil {
+				return nil, fmt.Errorf("gemini QA fallback: %w", err)
+			}
+		}
+	} else {
+		// No Claude available — use Gemini for QA
+		responseText, err = h.geminiQA(ctx, geminiClient, imageData, mimeType, qaPrompt)
+		if err != nil {
+			return nil, fmt.Errorf("gemini QA: %w", err)
+		}
+	}
+
+	responseText = cleanMarkdownFences(responseText)
+	if responseText == "" {
+		return nil, fmt.Errorf("empty QA response")
+	}
+
+	var report qaReport
+	if err := json.Unmarshal([]byte(responseText), &report); err != nil {
+		return nil, fmt.Errorf("parse QA response: %w", err)
+	}
+
+	return &report, nil
+}
+
+// geminiQA sends a QA request to Gemini (used as fallback when Claude is unavailable).
+func (h *Handler) geminiQA(ctx context.Context, geminiClient gemini.Client, imageData []byte, mimeType, qaPrompt string) (string, error) {
+	temp := float32(0.1)
+	return geminiClient.GenerateContent(ctx, "gemini-2.5-flash", []gemini.Part{
+		{Text: qaPrompt},
+		{Data: imageData, MIMEType: mimeType},
+	}, &gemini.GenerateConfig{
+		Temperature:      &temp,
+		ResponseMIMEType: "application/json",
+	})
+}
+
+// getClaudeClient lazily initializes the Claude client from secrets.
+// Returns nil, nil if no ANTHROPIC_API_KEY is configured (triggering Gemini fallback).
+func (h *Handler) getClaudeClient(ctx context.Context) (anthropic.Client, error) {
+	if h.claude != nil {
+		return h.claude, nil
+	}
+
+	secretARN := mustEnv("GEMINI_SECRET_ARN") // Same secret, different key
+	if secretARN == "" {
+		return nil, nil
+	}
+
+	raw, err := h.secrets.GetSecret(ctx, secretARN)
+	if err != nil {
+		return nil, fmt.Errorf("get secret: %w", err)
+	}
+
+	var secretMap map[string]string
+	if err := json.Unmarshal([]byte(raw), &secretMap); err != nil {
+		return nil, fmt.Errorf("parse secret: %w", err)
+	}
+
+	apiKey := secretMap["ANTHROPIC_API_KEY"]
+	if apiKey == "" {
+		// Key not configured — fall back to Gemini QA
+		return nil, nil
+	}
+
+	client := anthropic.New(apiKey)
+	h.claude = client
 	return client, nil
 }
 
@@ -575,14 +853,15 @@ func checkAircraftIdentity(entry *extractedEntry, expected expectedIdentity) {
 
 func cleanMarkdownFences(s string) string {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```json") {
-		s = s[7:]
-	} else if strings.HasPrefix(s, "```") {
-		s = s[3:]
+	// Strip all leading backticks and optional language tag
+	if idx := strings.IndexByte(s, '`'); idx == 0 {
+		s = strings.TrimLeft(s, "`")
+		// Remove optional language tag (e.g. "json\n")
+		s = strings.TrimPrefix(s, "json")
+		s = strings.TrimLeft(s, " \t\r\n")
 	}
-	if strings.HasSuffix(s, "```") {
-		s = s[:len(s)-3]
-	}
+	// Strip all trailing backticks
+	s = strings.TrimRight(s, "` \t\r\n")
 	return strings.TrimSpace(s)
 }
 

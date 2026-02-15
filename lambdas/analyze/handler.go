@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 
+	"github.com/projectcloudline/logbook-service/internal/anthropic"
 	"github.com/projectcloudline/logbook-service/internal/awsutil"
 	"github.com/projectcloudline/logbook-service/internal/db"
 	"github.com/projectcloudline/logbook-service/internal/gemini"
@@ -19,6 +20,7 @@ type Handler struct {
 	s3      awsutil.S3Client
 	secrets awsutil.SecretsProvider
 	gemini  gemini.Client
+	claude  anthropic.Client
 	bucket  string
 }
 
