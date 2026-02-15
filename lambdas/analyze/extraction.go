@@ -853,14 +853,15 @@ func checkAircraftIdentity(entry *extractedEntry, expected expectedIdentity) {
 
 func cleanMarkdownFences(s string) string {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```json") {
-		s = s[7:]
-	} else if strings.HasPrefix(s, "```") {
-		s = s[3:]
+	// Strip all leading backticks and optional language tag
+	if idx := strings.IndexByte(s, '`'); idx == 0 {
+		s = strings.TrimLeft(s, "`")
+		// Remove optional language tag (e.g. "json\n")
+		s = strings.TrimPrefix(s, "json")
+		s = strings.TrimLeft(s, " \t\r\n")
 	}
-	if strings.HasSuffix(s, "```") {
-		s = s[:len(s)-3]
-	}
+	// Strip all trailing backticks
+	s = strings.TrimRight(s, "` \t\r\n")
 	return strings.TrimSpace(s)
 }
 

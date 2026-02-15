@@ -111,9 +111,16 @@ CRITICAL RULES:
 - Abbreviations like "w/o", "R/R", "c/w", "IAW", "P/N", "S/N" are CORRECT and should NOT be flagged
 - Minor formatting differences (spacing, capitalization) are NOT issues unless they change meaning
 
+AIRCRAFT IDENTITY RULES:
+- Logbook entries often omit the aircraft make, model, or even registration — this is NORMAL and NOT an issue
+- All entries in a logbook are presumed to belong to the aircraft that logbook is for
+- Only flag aircraft identity fields if the extracted value CONFLICTS with what is visible (e.g., wrong N-number, wrong serial)
+- Do NOT flag missing aircraft identity fields (null/empty make, model, registration, serial)
+- Do NOT infer aircraft make/model from context (e.g., from service bulletin references or part numbers)
+
 WHAT TO CHECK:
 - Date: Does the extracted date match what is visible?
-- Aircraft identifiers: Registration, serial number, make, model
+- Aircraft identifiers: ONLY if present — check that extracted values match (do NOT flag missing values)
 - Time readings: Hobbs, tach, flight time, TSO/TSMOH
 - Shop/mechanic information: Names, certificate numbers, addresses
 - Maintenance narrative: Is every visible word captured? Is anything added that is not visible? Is anything truncated?

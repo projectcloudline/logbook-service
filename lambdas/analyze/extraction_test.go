@@ -318,6 +318,8 @@ func TestCleanMarkdownFences(t *testing.T) {
 		{"no fences", `{"key":"value"}`, `{"key":"value"}`},
 		{"json fences", "```json\n{\"key\":\"value\"}\n```", `{"key":"value"}`},
 		{"plain fences", "```\n{\"key\":\"value\"}\n```", `{"key":"value"}`},
+		{"trailing backticks after fence", "```json\n{\"key\":\"value\"}\n```\n`", `{"key":"value"}`},
+		{"extra backtick sequences", "````json\n{\"key\":\"value\"}\n````", `{"key":"value"}`},
 		{"empty", "", ""},
 	}
 
