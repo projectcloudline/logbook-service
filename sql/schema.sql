@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS maintenance_entries (
     confidence_score DECIMAL(3,2),
     needs_review BOOLEAN DEFAULT FALSE,
     missing_data TEXT[],
+    extraction_notes TEXT,
     review_status VARCHAR(20) DEFAULT 'pending'
         CHECK (review_status IN ('pending', 'approved', 'corrected', 'rejected')),
     reviewed_by VARCHAR(100),

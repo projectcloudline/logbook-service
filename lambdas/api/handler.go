@@ -648,7 +648,7 @@ func (h *Handler) handleEntries(ctx context.Context, tailNumber string, event ev
 		fmt.Sprintf(`SELECT me.id, me.entry_type, me.entry_date, me.hobbs_time, me.tach_time,
 		        me.flight_time, me.shop_name, me.mechanic_name,
 		        me.maintenance_narrative, me.confidence_score, me.needs_review,
-		        me.review_status, me.missing_data,
+		        me.review_status, me.missing_data, me.extraction_notes,
 		        ir.inspection_type
 		 FROM maintenance_entries me
 		 LEFT JOIN inspection_records ir ON ir.entry_id = me.id

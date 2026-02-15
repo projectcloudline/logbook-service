@@ -659,14 +659,19 @@ func (h *Handler) saveEntry(ctx context.Context, aircraftID, pageID string, entr
 		missingData = entry.MissingData
 	}
 
+	var extractionNotes any
+	if entry.ExtractionNotes != "" {
+		extractionNotes = entry.ExtractionNotes
+	}
+
 	entryID, err := h.db.Insert(ctx,
 		`INSERT INTO maintenance_entries
 		 (aircraft_id, page_id, entry_type, entry_date, hobbs_time, tach_time,
 		  flight_time, time_since_overhaul, shop_name, shop_address, shop_phone,
 		  repair_station_number, mechanic_name, mechanic_certificate,
 		  work_order_number, maintenance_narrative, confidence_score,
-		  needs_review, missing_data)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+		  needs_review, missing_data, extraction_notes)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 		 RETURNING id`,
 		aircraftID, pageID,
 		entry.EntryType,
@@ -686,6 +691,7 @@ func (h *Handler) saveEntry(ctx context.Context, aircraftID, pageID string, entr
 		entry.Confidence,
 		entry.NeedsReview,
 		missingData,
+		extractionNotes,
 	)
 	if err != nil {
 		return fmt.Errorf("insert entry: %w", err)
