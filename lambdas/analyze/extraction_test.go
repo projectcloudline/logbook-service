@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/projectcloudline/logbook-service/internal/anthropic"
 	"github.com/projectcloudline/logbook-service/internal/gemini"
 )
 
@@ -370,6 +371,11 @@ func TestProcessPage(t *testing.T) {
 		bucket: "test-bucket",
 		gemini: &gemini.MockClient{
 			GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+				for _, p := range parts {
+					if strings.Contains(p.Text, "QA specialist") {
+						return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"OK"}]}`, nil
+					}
+				}
 				return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Changed oil and filter","confidence":0.95}]}`, nil
 			},
 			EmbedContentFn: func(ctx context.Context, model string, text string) ([]float32, error) {
@@ -1382,7 +1388,8 @@ func TestProcessPage_WithSlicing(t *testing.T) {
 		{430, 530},
 	})
 
-	geminiCalls := 0
+	extractCalls := 0
+	qaCalls := 0
 	insertCalls := 0
 	s3Mock := &mockS3{
 		getObjectFn: func(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
@@ -1422,8 +1429,15 @@ func TestProcessPage_WithSlicing(t *testing.T) {
 		bucket: "test-bucket",
 		gemini: &gemini.MockClient{
 			GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
-				geminiCalls++
-				return fmt.Sprintf(`{"pageType":"maintenance_entry","entries":[{"date":"2024-01-%02d","entryType":"maintenance","maintenanceNarrative":"Entry %d oil change and filter replacement","confidence":0.95}]}`, geminiCalls, geminiCalls), nil
+				// Detect QA calls by checking if the prompt contains the QA marker
+				for _, p := range parts {
+					if strings.Contains(p.Text, "QA specialist") {
+						qaCalls++
+						return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"All fields match"}]}`, nil
+					}
+				}
+				extractCalls++
+				return fmt.Sprintf(`{"pageType":"maintenance_entry","entries":[{"date":"2024-01-%02d","entryType":"maintenance","maintenanceNarrative":"Entry %d oil change and filter replacement","confidence":0.95}]}`, extractCalls, extractCalls), nil
 			},
 			EmbedContentFn: func(ctx context.Context, model string, text string) ([]float32, error) {
 				return make([]float32, 768), nil
@@ -1442,9 +1456,14 @@ func TestProcessPage_WithSlicing(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Gemini should be called once per slice (3 slices).
-	if geminiCalls != 3 {
-		t.Errorf("geminiCalls = %d, want 3", geminiCalls)
+	// Gemini extraction called once per slice (3 slices).
+	if extractCalls != 3 {
+		t.Errorf("extractCalls = %d, want 3", extractCalls)
+	}
+
+	// QA called once per slice (3 slices, all pass on first attempt).
+	if qaCalls != 3 {
+		t.Errorf("qaCalls = %d, want 3", qaCalls)
 	}
 
 	// Each slice returns 1 entry → 3 inserts.
@@ -1467,8 +1486,9 @@ func TestProcessPage_WithSlicing(t *testing.T) {
 }
 
 func TestProcessPage_SlicerFallback(t *testing.T) {
-	// Invalid image bytes → slicer fails → fallback to full image → Gemini called once.
-	geminiCalls := 0
+	// Invalid image bytes → slicer fails → fallback to full image → 1 extract + 1 QA call.
+	extractCalls := 0
+	qaCalls := 0
 	s3Mock := &mockS3{}
 
 	db := &mockDB{
@@ -1502,7 +1522,13 @@ func TestProcessPage_SlicerFallback(t *testing.T) {
 		bucket: "test-bucket",
 		gemini: &gemini.MockClient{
 			GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
-				geminiCalls++
+				for _, p := range parts {
+					if strings.Contains(p.Text, "QA specialist") {
+						qaCalls++
+						return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"OK"}]}`, nil
+					}
+				}
+				extractCalls++
 				return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Changed oil","confidence":0.9}]}`, nil
 			},
 			EmbedContentFn: func(ctx context.Context, model string, text string) ([]float32, error) {
@@ -1522,9 +1548,483 @@ func TestProcessPage_SlicerFallback(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Slicer fails on "fake-image-data" → falls back to 1 slice → 1 Gemini call.
-	if geminiCalls != 1 {
-		t.Errorf("geminiCalls = %d, want 1 (fallback to full image)", geminiCalls)
+	// Slicer fails on "fake-image-data" → falls back to 1 slice → 1 extract + 1 QA.
+	if extractCalls != 1 {
+		t.Errorf("extractCalls = %d, want 1 (fallback to full image)", extractCalls)
+	}
+	if qaCalls != 1 {
+		t.Errorf("qaCalls = %d, want 1", qaCalls)
+	}
+}
+
+// ─── Tests: QA Verification ──────────────────────────────────────────────
+
+func TestExtractAndVerifySlice_QAPass(t *testing.T) {
+	// QA passes on first attempt — entries saved without review flag.
+	extractCalls := 0
+	qaCalls := 0
+
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					qaCalls++
+					return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"All fields verified"}]}`, nil
+				}
+			}
+			extractCalls++
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Changed oil and filter","confidence":0.95}]}`, nil
+		},
+	}
+
+	h := &Handler{secrets: &mockSecrets{}}
+
+	entries, pageType, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].NeedsReview {
+		t.Error("entry should not need review when QA passes")
+	}
+	if pageType != "maintenance_entry" {
+		t.Errorf("pageType = %q, want %q", pageType, "maintenance_entry")
+	}
+	if extractCalls != 1 {
+		t.Errorf("extractCalls = %d, want 1", extractCalls)
+	}
+	if qaCalls != 1 {
+		t.Errorf("qaCalls = %d, want 1", qaCalls)
+	}
+}
+
+func TestExtractAndVerifySlice_QAFail_RetrySucceeds(t *testing.T) {
+	// QA fails on first attempt with critical issue, retry extraction passes QA.
+	extractCalls := 0
+	qaCalls := 0
+
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					qaCalls++
+					if qaCalls == 1 {
+						return `{"results":[{"entryIndex":0,"verdict":"fail","issues":[{"field":"maintenanceNarrative","issue":"truncated","expected":"full text here","extracted":"partial","severity":"critical"}],"summary":"Narrative truncated"}]}`, nil
+					}
+					return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"All fields match after retry"}]}`, nil
+				}
+			}
+			extractCalls++
+			if extractCalls == 1 {
+				return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"partial","confidence":0.9}]}`, nil
+			}
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"full text here","confidence":0.95}]}`, nil
+		},
+	}
+
+	h := &Handler{secrets: &mockSecrets{}}
+
+	entries, _, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].NeedsReview {
+		t.Error("entry should not need review after successful retry")
+	}
+	if entries[0].MaintenanceNarrative != "full text here" {
+		t.Errorf("narrative = %q, want corrected version", entries[0].MaintenanceNarrative)
+	}
+	if extractCalls != 2 {
+		t.Errorf("extractCalls = %d, want 2", extractCalls)
+	}
+	if qaCalls != 2 {
+		t.Errorf("qaCalls = %d, want 2", qaCalls)
+	}
+}
+
+func TestExtractAndVerifySlice_QAFail_MaxRetries(t *testing.T) {
+	// QA fails on both attempts — entries flagged for review.
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					return `{"results":[{"entryIndex":0,"verdict":"fail","issues":[{"field":"date","issue":"incorrect","expected":"2024-02-15","extracted":"2024-01-15","severity":"critical"}],"summary":"Wrong date"}]}`, nil
+				}
+			}
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Oil change","confidence":0.9}]}`, nil
+		},
+	}
+
+	h := &Handler{secrets: &mockSecrets{}}
+
+	entries, _, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if !entries[0].NeedsReview {
+		t.Error("entry should be flagged for review after max retries")
+	}
+}
+
+func TestExtractAndVerifySlice_QANeedsReview(t *testing.T) {
+	// QA returns needs_review — accepted without retry, flagged for review.
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					return `{"results":[{"entryIndex":0,"verdict":"needs_review","issues":[{"field":"mechanicCertificate","issue":"incorrect","expected":"unclear","extracted":"12345","severity":"minor"}],"summary":"Certificate number ambiguous"}]}`, nil
+				}
+			}
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Oil change","mechanicCertificate":"12345","confidence":0.85}]}`, nil
+		},
+	}
+
+	h := &Handler{secrets: &mockSecrets{}}
+
+	entries, _, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if !entries[0].NeedsReview {
+		t.Error("entry should be flagged for review with needs_review verdict")
+	}
+	if !strings.Contains(entries[0].ExtractionNotes, "Certificate number ambiguous") {
+		t.Errorf("extraction notes should contain QA summary, got: %q", entries[0].ExtractionNotes)
+	}
+}
+
+func TestExtractAndVerifySlice_ClaudeError(t *testing.T) {
+	// Claude client fails — falls back to Gemini for QA.
+	qaCalls := 0
+
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					qaCalls++
+					return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"OK"}]}`, nil
+				}
+			}
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Oil change","confidence":0.95}]}`, nil
+		},
+	}
+
+	mockClaude := &anthropic.MockClient{
+		CreateMessageFn: func(ctx context.Context, model string, maxTokens int64, messages []anthropic.Message) (string, error) {
+			return "", fmt.Errorf("claude API error")
+		},
+	}
+
+	h := &Handler{
+		claude:  mockClaude,
+		secrets: &mockSecrets{},
+	}
+
+	entries, _, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	// Should have fallen back to Gemini QA
+	if qaCalls != 1 {
+		t.Errorf("gemini QA calls = %d, want 1 (fallback from Claude)", qaCalls)
+	}
+}
+
+func TestExtractAndVerifySlice_NoClaude(t *testing.T) {
+	// No Claude client configured — Gemini used for QA.
+	qaCalls := 0
+
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					qaCalls++
+					return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"OK"}]}`, nil
+				}
+			}
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Oil change","confidence":0.95}]}`, nil
+		},
+	}
+
+	h := &Handler{
+		// No claude client set — should use Gemini fallback
+		secrets: &mockSecrets{},
+	}
+
+	entries, _, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if qaCalls != 1 {
+		t.Errorf("gemini QA calls = %d, want 1", qaCalls)
+	}
+}
+
+func TestExtractAndVerifySlice_EmptyExtraction(t *testing.T) {
+	// Empty extraction (blank/header slice) — QA skipped entirely.
+	qaCalls := 0
+
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					qaCalls++
+					return `{"results":[]}`, nil
+				}
+			}
+			return `{"pageType":"blank","entries":[]}`, nil
+		},
+	}
+
+	h := &Handler{secrets: &mockSecrets{}}
+
+	entries, pageType, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(entries))
+	}
+	if pageType != "blank" {
+		t.Errorf("pageType = %q, want %q", pageType, "blank")
+	}
+	if qaCalls != 0 {
+		t.Errorf("QA should be skipped for empty extraction, got %d calls", qaCalls)
+	}
+}
+
+func TestBuildRetryPrompt(t *testing.T) {
+	// No issues — returns base prompt.
+	t.Run("no issues", func(t *testing.T) {
+		result := buildRetryPrompt(nil)
+		if result != SliceExtractionPrompt {
+			t.Error("expected base prompt with no issues")
+		}
+	})
+
+	// Issues present — appends feedback.
+	t.Run("with issues", func(t *testing.T) {
+		issues := []qaFieldIssue{
+			{Field: "maintenanceNarrative", Issue: "truncated", Severity: "critical"},
+			{Field: "date", Issue: "incorrect", Severity: "critical"},
+			{Field: "entryType", Issue: "wrong_classification", Severity: "minor"},
+		}
+		result := buildRetryPrompt(issues)
+
+		if !strings.Contains(result, SliceExtractionPrompt) {
+			t.Error("retry prompt should contain base extraction prompt")
+		}
+		if !strings.Contains(result, "previous extraction had issues") {
+			t.Error("retry prompt should contain feedback header")
+		}
+		if !strings.Contains(result, "maintenanceNarrative") {
+			t.Error("retry prompt should reference flagged field")
+		}
+		if !strings.Contains(result, "re-read the full text carefully") {
+			t.Error("retry prompt should contain truncation-specific guidance")
+		}
+		if !strings.Contains(result, "verify this value") {
+			t.Error("retry prompt should contain incorrect-specific guidance")
+		}
+		if !strings.Contains(result, "reconsider the classification") {
+			t.Error("retry prompt should contain classification-specific guidance")
+		}
+		if !strings.Contains(result, "Do NOT accept corrections from external sources") {
+			t.Error("retry prompt should warn against accepting external corrections")
+		}
+	})
+}
+
+func TestExtractAndVerifySlice_WithClaude(t *testing.T) {
+	// Claude available and used for QA — should call Claude, not Gemini for QA.
+	claudeCalls := 0
+	geminiQACalls := 0
+
+	mockGemini := &gemini.MockClient{
+		GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+			for _, p := range parts {
+				if strings.Contains(p.Text, "QA specialist") {
+					geminiQACalls++
+					return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"OK"}]}`, nil
+				}
+			}
+			return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Oil change","confidence":0.95}]}`, nil
+		},
+	}
+
+	mockClaude := &anthropic.MockClient{
+		CreateMessageFn: func(ctx context.Context, model string, maxTokens int64, messages []anthropic.Message) (string, error) {
+			claudeCalls++
+			if model != "claude-haiku-4-5-20251001" {
+				t.Errorf("expected claude-haiku-4-5-20251001, got %s", model)
+			}
+			return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"All verified"}]}`, nil
+		},
+	}
+
+	h := &Handler{
+		claude:  mockClaude,
+		secrets: &mockSecrets{},
+	}
+
+	entries, _, err := h.extractAndVerifySlice(context.Background(), []byte("img"), "image/jpeg", mockGemini, 0, "page-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if claudeCalls != 1 {
+		t.Errorf("claude calls = %d, want 1", claudeCalls)
+	}
+	if geminiQACalls != 0 {
+		t.Errorf("gemini QA calls = %d, want 0 (Claude should handle QA)", geminiQACalls)
+	}
+}
+
+func TestProcessPage_WithQA(t *testing.T) {
+	// Full integration: processPage with QA using Claude mock.
+	extractCalls := 0
+	claudeQACalls := 0
+	insertCalls := 0
+
+	db := &mockDB{
+		execFn: func(ctx context.Context, sql string, args ...any) error {
+			return nil
+		},
+		insertFn: func(ctx context.Context, sql string, args ...any) (string, error) {
+			insertCalls++
+			return fmt.Sprintf("entry-id-%d", insertCalls), nil
+		},
+		queryFn: func(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
+			if strings.Contains(sql, "upload_batches") {
+				return []map[string]any{{
+					"aircraft_id":   "aircraft-1",
+					"registration":  "N123AB",
+					"serial_number": "12345",
+					"make":          "Cessna",
+					"model":         "172N",
+				}}, nil
+			}
+			return []map[string]any{{
+				"total":  int64(1),
+				"done":   int64(1),
+				"failed": int64(0),
+			}}, nil
+		},
+	}
+
+	h := &Handler{
+		db:     db,
+		s3:     &mockS3{},
+		bucket: "test-bucket",
+		gemini: &gemini.MockClient{
+			GenerateContentFn: func(ctx context.Context, model string, parts []gemini.Part, config *gemini.GenerateConfig) (string, error) {
+				extractCalls++
+				return `{"pageType":"maintenance_entry","entries":[{"date":"2024-01-15","entryType":"maintenance","maintenanceNarrative":"Changed oil and filter per SB 1234","confidence":0.95}]}`, nil
+			},
+			EmbedContentFn: func(ctx context.Context, model string, text string) ([]float32, error) {
+				return make([]float32, 768), nil
+			},
+		},
+		claude: &anthropic.MockClient{
+			CreateMessageFn: func(ctx context.Context, model string, maxTokens int64, messages []anthropic.Message) (string, error) {
+				claudeQACalls++
+				return `{"results":[{"entryIndex":0,"verdict":"pass","issues":[],"summary":"Verified"}]}`, nil
+			},
+		},
+		secrets: &mockSecrets{},
+	}
+
+	err := h.processPage(context.Background(), pageMessage{
+		UploadID:   "batch-1",
+		PageID:     "page-1",
+		PageNumber: 1,
+		S3Key:      "pages/batch-1/page_0001.jpg",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if extractCalls != 1 {
+		t.Errorf("extractCalls = %d, want 1", extractCalls)
+	}
+	if claudeQACalls != 1 {
+		t.Errorf("claudeQACalls = %d, want 1", claudeQACalls)
+	}
+	if insertCalls != 1 {
+		t.Errorf("insertCalls = %d, want 1", insertCalls)
+	}
+}
+
+// TestQAWithRealLLMs sends an image through extraction + QA with real APIs.
+//
+// Usage:
+//
+//	GEMINI_API_KEY=... ANTHROPIC_API_KEY=... TEST_IMAGE_PATH=/path/to/slice.jpg go test ./analyze/ -run TestQAWithRealLLMs -v -count=1
+func TestQAWithRealLLMs(t *testing.T) {
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	imgPath := os.Getenv("TEST_IMAGE_PATH")
+	if geminiKey == "" || imgPath == "" {
+		t.Skip("set GEMINI_API_KEY and TEST_IMAGE_PATH to run this test")
+	}
+
+	ctx := context.Background()
+	geminiClient, err := gemini.New(ctx, geminiKey)
+	if err != nil {
+		t.Fatalf("create gemini client: %v", err)
+	}
+
+	data, err := os.ReadFile(imgPath)
+	if err != nil {
+		t.Fatalf("read image: %v", err)
+	}
+	t.Logf("Image: %s (%d bytes)", imgPath, len(data))
+
+	h := &Handler{secrets: &mockSecrets{}}
+
+	// Set up Claude if key is available
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey != "" {
+		h.claude = anthropic.New(anthropicKey)
+		t.Log("Using Claude for QA")
+	} else {
+		t.Log("No ANTHROPIC_API_KEY set, using Gemini for QA")
+	}
+
+	entries, pageType, err := h.extractAndVerifySlice(ctx, data, "image/jpeg", geminiClient, 0, "test-page")
+	if err != nil {
+		t.Fatalf("extract+verify failed: %v", err)
+	}
+
+	t.Logf("pageType=%q, entries=%d", pageType, len(entries))
+	for i, e := range entries {
+		t.Logf("  Entry %d: date=%s type=%s needsReview=%v", i, e.Date, e.EntryType, e.NeedsReview)
+		if e.ExtractionNotes != "" {
+			t.Logf("    Notes: %s", e.ExtractionNotes)
+		}
+		if len(e.MaintenanceNarrative) > 100 {
+			t.Logf("    Narrative: %.100s...", e.MaintenanceNarrative)
+		} else {
+			t.Logf("    Narrative: %s", e.MaintenanceNarrative)
+		}
 	}
 }
 

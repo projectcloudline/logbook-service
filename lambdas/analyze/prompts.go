@@ -1,5 +1,10 @@
 package main
 
+import (
+	"fmt"
+	"strings"
+)
+
 // SliceExtractionPrompt is sent to Gemini with each cropped entry strip.
 // It demands verbatim transcription — no summarizing, no grammar correction.
 const SliceExtractionPrompt = `You are an expert data entry specialist. Your job is to transcribe this single logbook entry VERBATIM.
@@ -89,6 +94,114 @@ Return JSON format:
     }
   ]
 }`
+
+// QAVerificationPrompt is sent to the QA model (Claude or Gemini fallback) with
+// the slice image and the extraction JSON. The QA model verifies each extracted
+// entry against the image and returns a structured verdict.
+const QAVerificationPrompt = `You are a QA specialist verifying another AI model's extraction of aircraft maintenance logbook entries. You will receive:
+1. An image of a cropped logbook entry
+2. The JSON extraction produced by the extraction model
+
+YOUR ROLE: Verify that the extraction accurately reflects what is visible in the image.
+
+CRITICAL RULES:
+- You CANNOT infer, guess, or fill in data that is not clearly visible in the image
+- You CANNOT correct grammar, spelling, or abbreviations — the extraction SHOULD preserve these exactly as written
+- You MUST compare each field value against what is actually visible in the image
+- Abbreviations like "w/o", "R/R", "c/w", "IAW", "P/N", "S/N" are CORRECT and should NOT be flagged
+- Minor formatting differences (spacing, capitalization) are NOT issues unless they change meaning
+
+WHAT TO CHECK:
+- Date: Does the extracted date match what is visible?
+- Aircraft identifiers: Registration, serial number, make, model
+- Time readings: Hobbs, tach, flight time, TSO/TSMOH
+- Shop/mechanic information: Names, certificate numbers, addresses
+- Maintenance narrative: Is every visible word captured? Is anything added that is not visible? Is anything truncated?
+- Parts actions: Part numbers, serial numbers, action types, quantities
+- AD compliance: AD numbers, compliance methods
+- Entry type classification: Is the categorization reasonable?
+
+ERROR TAXONOMY — use these exact values for the "issue" field:
+
+Entry-level issues:
+- "missing_entry" — a visible entry in the image was not extracted at all
+- "fabricated_entry" — an entry in the extraction has no corresponding content in the image
+
+Field-level issues:
+- "incorrect" — field value does not match what is visible (wrong characters, numbers, words)
+- "truncated" — narrative or field value is cut short, missing visible words
+- "missing_field" — field is clearly visible in the image but extracted as null or empty
+- "added_text" — words present in the extraction that are not visible in the image
+- "wrong_classification" — entryType, inspectionType, or action type is miscategorized
+
+Severity:
+- "critical" — wrong part number, serial number, AD number, date; missing or added narrative text; fabricated or missed entries
+- "minor" — formatting differences, classification edge cases, ambiguous or illegible readings
+
+VERDICT LOGIC:
+- "pass" — no critical issues found
+- "needs_review" — only minor issues or ambiguous/illegible areas where you cannot determine correctness
+- "fail" — one or more critical issues are present
+
+Return JSON format:
+{
+  "results": [
+    {
+      "entryIndex": 0,
+      "verdict": "pass | fail | needs_review",
+      "issues": [
+        {
+          "field": "maintenanceNarrative",
+          "issue": "truncated",
+          "expected": "what you see in the image",
+          "extracted": "what the extraction contains",
+          "severity": "critical"
+        }
+      ],
+      "summary": "Brief explanation of your verdict"
+    }
+  ]
+}
+
+If the extraction has no entries and the image shows no entries (blank/header), return:
+{"results": []}
+
+IMPORTANT: Be precise and conservative. Only flag genuine discrepancies you can clearly see. When in doubt about legibility, use "needs_review" verdict with a "minor" severity issue explaining the ambiguity.`
+
+// buildRetryPrompt appends QA feedback to the extraction prompt for a retry
+// attempt. It tells the extraction model WHICH fields were flagged and WHAT
+// type of issue was found, but does NOT include the QA model's expected values.
+// This prevents the extraction model from blindly accepting corrections.
+func buildRetryPrompt(issues []qaFieldIssue) string {
+	if len(issues) == 0 {
+		return SliceExtractionPrompt
+	}
+
+	var lines []string
+	lines = append(lines, "Your previous extraction had issues that need correction:")
+	for _, issue := range issues {
+		line := fmt.Sprintf("- Field %q: may be %s (%s) — ", issue.Field, issue.Issue, issue.Severity)
+		switch issue.Issue {
+		case "truncated":
+			line += "re-read the full text carefully, you may have stopped too early"
+		case "incorrect":
+			line += "verify this value against the image"
+		case "missing_field":
+			line += "look more carefully for this field in the image"
+		case "added_text":
+			line += "remove any words not visible in the image"
+		case "wrong_classification":
+			line += "reconsider the classification"
+		default:
+			line += "re-examine the image carefully"
+		}
+		lines = append(lines, line)
+	}
+	lines = append(lines, "Do NOT accept corrections from external sources. Re-examine the original image yourself.")
+	lines = append(lines, "")
+
+	return SliceExtractionPrompt + "\n\n" + strings.Join(lines, "\n")
+}
 
 // MaintenanceExtractionPrompt is the original full-page prompt (kept for reference/fallback).
 const MaintenanceExtractionPrompt = `Analyze this aircraft logbook page image and extract all maintenance entries.
