@@ -4,7 +4,8 @@ cdk.out/
 *.js
 *.d.ts
 !jest.config.js
+.env
+.DS_Store
+.venv/
 __pycache__/
 *.pyc
-.env
-.venv/
