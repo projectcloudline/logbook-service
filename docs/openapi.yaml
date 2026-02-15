@@ -812,6 +812,10 @@ components:
           nullable: true
           items:
             type: string
+        extraction_notes:
+          type: string
+          nullable: true
+          description: QA verification notes explaining why an entry was flagged for review
         inspection_type:
           type: string
           nullable: true
