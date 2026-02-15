@@ -29,19 +29,6 @@ func encodeTestJPEG(img image.Image) []byte {
 	return buf.Bytes()
 }
 
-// smallImageOptions returns options scaled for small synthetic test images.
-// DefaultOptions is tuned for ~4032x3024 iPhone photos; these values are
-// proportionally reduced so the algorithm behaves correctly on tiny images.
-func smallImageOptions() Options {
-	return Options{
-		DarknessThreshold: 128,
-		DilationRadius:    5,
-		MinGapHeight:      5,
-		MinSliceHeight:    20,
-		Padding:           5,
-		JPEGQuality:       85,
-	}
-}
 
 func TestProjectionProfile(t *testing.T) {
 	// 100x100 image with a dark band from rows 20-40.
@@ -163,7 +150,7 @@ func TestSliceImage_ThreeBands(t *testing.T) {
 	})
 	jpegData := encodeTestJPEG(img)
 
-	slices, err := SliceImage(jpegData, smallImageOptions())
+	slices, err := SliceImage(jpegData, DefaultOptions())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -260,7 +247,7 @@ func TestSliceImage_PNGInput(t *testing.T) {
 
 	// Encode as JPEG since we need a simple test (PNG import is registered).
 	jpegData := encodeTestJPEG(img)
-	slices, err := SliceImage(jpegData, smallImageOptions())
+	slices, err := SliceImage(jpegData, DefaultOptions())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -336,6 +323,40 @@ func TestMergeRegions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestScaleToHeight(t *testing.T) {
+	base := DefaultOptions()
+
+	// Reference height — no change.
+	same := scaleToHeight(base, referenceHeight)
+	if same.DilationRadius != 80 {
+		t.Errorf("at reference height: DilationRadius = %d, want 80", same.DilationRadius)
+	}
+
+	// Half height — params halved.
+	half := scaleToHeight(base, referenceHeight/2)
+	if half.DilationRadius != 40 {
+		t.Errorf("at half height: DilationRadius = %d, want 40", half.DilationRadius)
+	}
+	if half.MinSliceHeight != 75 {
+		t.Errorf("at half height: MinSliceHeight = %d, want 75", half.MinSliceHeight)
+	}
+
+	// Very small image — floors at 1.
+	tiny := scaleToHeight(base, 100)
+	if tiny.DilationRadius < 1 {
+		t.Errorf("at tiny height: DilationRadius = %d, want >= 1", tiny.DilationRadius)
+	}
+	if tiny.Padding < 1 {
+		t.Errorf("at tiny height: Padding = %d, want >= 1", tiny.Padding)
+	}
+
+	// Double height — params doubled.
+	double := scaleToHeight(base, referenceHeight*2)
+	if double.DilationRadius != 160 {
+		t.Errorf("at double height: DilationRadius = %d, want 160", double.DilationRadius)
 	}
 }
 
@@ -415,7 +436,7 @@ func TestSliceImage_GrayscaleDetection(t *testing.T) {
 	}
 
 	jpegData := encodeTestJPEG(img)
-	slices, err := SliceImage(jpegData, smallImageOptions())
+	slices, err := SliceImage(jpegData, DefaultOptions())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

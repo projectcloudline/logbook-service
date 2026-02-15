@@ -161,6 +161,7 @@ func TestSliceProfileDiag(t *testing.T) {
 	t.Logf("Image: %dx%d", width, height)
 
 	opts := DefaultOptions()
+	opts = scaleToHeight(opts, height) // match SliceImage behavior
 	profile := projectionProfile(img, bounds, opts.DarknessThreshold)
 
 	// Apply the same processing as SliceImage: noise floor then smoothing
@@ -182,7 +183,7 @@ func TestSliceProfileDiag(t *testing.T) {
 			maxSmoothed = v
 		}
 	}
-	t.Logf("Noise floor: %d (7%% of %d), smoothing radius: %d, content threshold: %d",
+	t.Logf("Noise floor: %d (7%% of %d), smoothing radius: %d (scaled), content threshold: %d",
 		noiseFloor, width, opts.DilationRadius, contentThreshold)
 	t.Logf("Smoothed profile max: %d", maxSmoothed)
 

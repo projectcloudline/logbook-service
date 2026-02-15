@@ -36,7 +36,9 @@ type Slice struct {
 }
 
 // DefaultOptions returns sensible defaults for logbook page slicing.
-// Tuned for iPhone photos of logbook pages (~4032x3024).
+// Spatial parameters (DilationRadius, MinGapHeight, MinSliceHeight, Padding)
+// are calibrated for a reference height of 3024 pixels (iPhone portrait photo)
+// and are automatically scaled to the actual image height by SliceImage.
 func DefaultOptions() Options {
 	return Options{
 		DarknessThreshold: 128,
@@ -46,6 +48,30 @@ func DefaultOptions() Options {
 		Padding:           15,
 		JPEGQuality:       85,
 	}
+}
+
+// referenceHeight is the image height that DefaultOptions spatial parameters
+// are calibrated against (iPhone portrait photo at ~4032x3024).
+const referenceHeight = 3024
+
+// scaleToHeight returns a copy of opts with spatial parameters scaled
+// proportionally from referenceHeight to the actual image height.
+func scaleToHeight(opts Options, height int) Options {
+	if height <= 0 || height == referenceHeight {
+		return opts
+	}
+	scale := func(v int) int {
+		s := v * height / referenceHeight
+		if s < 1 && v > 0 {
+			return 1
+		}
+		return s
+	}
+	opts.DilationRadius = scale(opts.DilationRadius)
+	opts.MinGapHeight = scale(opts.MinGapHeight)
+	opts.MinSliceHeight = scale(opts.MinSliceHeight)
+	opts.Padding = scale(opts.Padding)
+	return opts
 }
 
 // SliceImage decodes an image and splits it into horizontal strips at blank
@@ -73,6 +99,10 @@ func SliceImage(imageBytes []byte, opts Options) ([]Slice, error) {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
+
+	// Scale spatial parameters to the actual image height so the algorithm
+	// works consistently across different resolutions (phone cameras, scanners, etc).
+	opts = scaleToHeight(opts, height)
 
 	// Step 1: Compute vertical projection profile — count dark pixels per row.
 	profile := projectionProfile(img, bounds, opts.DarknessThreshold)

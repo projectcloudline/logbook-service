@@ -1375,12 +1375,10 @@ func TestSaveEntry_ShortNarrative(t *testing.T) {
 
 func TestProcessPage_WithSlicing(t *testing.T) {
 	// Create a JPEG with 3 dark bands → slicer should produce 3 slices.
-	// Image must be large enough for DefaultOptions (tuned for ~4032x3024):
-	// smoothing radius=80 requires gaps >160 rows, absorb needs bands >height/8.
-	testJPEG := makeTestJPEG(500, 2000, [][2]int{
-		{100, 400},
-		{600, 900},
-		{1100, 1400},
+	testJPEG := makeTestJPEG(200, 600, [][2]int{
+		{50, 130},
+		{230, 330},
+		{430, 530},
 	})
 
 	geminiCalls := 0
