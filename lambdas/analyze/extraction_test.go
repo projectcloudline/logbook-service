@@ -10,6 +10,7 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1525,6 +1526,61 @@ func TestProcessPage_SlicerFallback(t *testing.T) {
 	if geminiCalls != 1 {
 		t.Errorf("geminiCalls = %d, want 1 (fallback to full image)", geminiCalls)
 	}
+}
+
+// TestExtractionWithRealLLM sends an image through the actual Gemini API with
+// the SliceExtractionPrompt and prints the response. Use this to verify LLM
+// behavior on specific images (e.g., scanner backgrounds, blank pages).
+//
+// Usage:
+//
+//	GEMINI_API_KEY=... TEST_IMAGE_PATH=/tmp/slicer-pdf-batch/.../slice_001.jpg go test ./analyze/ -run TestExtractionWithRealLLM -v -count=1
+func TestExtractionWithRealLLM(t *testing.T) {
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	imgPath := os.Getenv("TEST_IMAGE_PATH")
+	if apiKey == "" || imgPath == "" {
+		t.Skip("set GEMINI_API_KEY and TEST_IMAGE_PATH to run this test")
+	}
+
+	ctx := context.Background()
+	client, err := gemini.New(ctx, apiKey)
+	if err != nil {
+		t.Fatalf("create gemini client: %v", err)
+	}
+
+	data, err := os.ReadFile(imgPath)
+	if err != nil {
+		t.Fatalf("read image: %v", err)
+	}
+	t.Logf("Image: %s (%d bytes)", imgPath, len(data))
+
+	temp := float32(0.1)
+	resp, err := client.GenerateContent(ctx, "gemini-2.5-flash", []gemini.Part{
+		{Text: SliceExtractionPrompt},
+		{Data: data, MIMEType: "image/jpeg"},
+	}, &gemini.GenerateConfig{
+		Temperature:      &temp,
+		ResponseMIMEType: "application/json",
+	})
+	if err != nil {
+		t.Fatalf("gemini call failed: %v", err)
+	}
+
+	// Pretty-print the JSON response.
+	var parsed json.RawMessage
+	if err := json.Unmarshal([]byte(resp), &parsed); err != nil {
+		t.Logf("Raw response (not JSON): %s", resp)
+	} else {
+		pretty, _ := json.MarshalIndent(parsed, "", "  ")
+		t.Logf("Response:\n%s", pretty)
+	}
+
+	// Parse and check entries.
+	var result extractionResult
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	t.Logf("pageType=%q, entries=%d", result.PageType, len(result.Entries))
 }
 
 func TestExtractBatchID(t *testing.T) {
